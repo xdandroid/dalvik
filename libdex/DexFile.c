@@ -19,6 +19,7 @@
  */
 
 #include "DexFile.h"
+#include "DexOptData.h"
 #include "DexProto.h"
 #include "DexCatch.h"
 #include "Leb128.h"
@@ -32,9 +33,6 @@
 #include <string.h>
 #include <fcntl.h>
 #include <errno.h>
-
-// fwd
-static u4 dexComputeOptChecksum(const DexOptHeader* pOptHeader);
 
 
 /*
@@ -90,7 +88,7 @@ bool dexIsValidMemberNameUtf8_0(const char** pUtf8Ptr) {
      * character (U+00a0, U+2000..U+200f, U+2028..U+202f,
      * U+fff0..U+ffff).
      */
-    
+
     u2 utf16 = dexGetUtf16FromUtf8(pUtf8Ptr);
 
     // Perform follow-up tests based on the high 8 bits.
@@ -139,7 +137,7 @@ bool dexIsValidMemberNameUtf8_0(const char** pUtf8Ptr) {
 /* Return whether the given string is a valid field or method name. */
 bool dexIsValidMemberName(const char* s) {
     bool angleName = false;
-    
+
     switch (*s) {
         case '\0': {
             // The empty string is not a valid name.
@@ -184,9 +182,9 @@ bool dexIsValidTypeDescriptor(const char* s) {
         // Arrays may have no more than 255 dimensions.
         return false;
     }
-    
+
     switch (*(s++)) {
-        case 'B': 
+        case 'B':
         case 'C':
         case 'D':
         case 'F':
@@ -443,7 +441,7 @@ DexClassLookup* dexCreateClassLookup(DexFile* pDexFile)
         pClassDef = dexGetClassDef(pDexFile, i);
         pString = dexStringByTypeIdx(pDexFile, pClassDef->classIdx);
 
-        classLookupAdd(pDexFile, pLookup, 
+        classLookupAdd(pDexFile, pLookup,
             (u1*)pString - pDexFile->baseAddr,
             (u1*)pClassDef - pDexFile->baseAddr, &numProbes);
 
@@ -478,213 +476,6 @@ void dexFileSetupBasicPointers(DexFile* pDexFile, const u1* data) {
     pDexFile->pProtoIds = (const DexProtoId*) (data + pHeader->protoIdsOff);
     pDexFile->pClassDefs = (const DexClassDef*) (data + pHeader->classDefsOff);
     pDexFile->pLinkData = (const DexLink*) (data + pHeader->linkOff);
-}
-
-
-/*
- * Parse out an index map entry, advancing "*pData" and reducing "*pSize".
- */
-static bool parseIndexMapEntry(const u1** pData, u4* pSize, bool expanding,
-    u4* pFullCount, u4* pReducedCount, const u2** pMap)
-{
-    const u4* wordPtr = (const u4*) *pData;
-    u4 size = *pSize;
-    u4 mapCount;
-
-    if (expanding) {
-        if (size < 4)
-            return false;
-        mapCount = *pReducedCount = *wordPtr++;
-        *pFullCount = (u4) -1;
-        size -= sizeof(u4);
-    } else {
-        if (size < 8)
-            return false;
-        mapCount = *pFullCount = *wordPtr++;
-        *pReducedCount = *wordPtr++;
-        size -= sizeof(u4) * 2;
-    }
-
-    u4 mapSize = mapCount * sizeof(u2);
-
-    if (size < mapSize)
-        return false;
-    *pMap = (const u2*) wordPtr;
-    size -= mapSize;
-
-    /* advance the pointer */
-    const u1* ptr = (const u1*) wordPtr;
-    ptr += (mapSize + 3) & ~0x3;
-
-    /* update pass-by-reference values */
-    *pData = (const u1*) ptr;
-    *pSize = size;
-
-    return true;
-}
-
-/*
- * Set up some pointers into the mapped data.
- *
- * See analysis/ReduceConstants.c for the data layout description.
- */
-static bool parseIndexMap(DexFile* pDexFile, const u1* data, u4 size,
-    bool expanding)
-{
-    if (!parseIndexMapEntry(&data, &size, expanding,
-            &pDexFile->indexMap.classFullCount,
-            &pDexFile->indexMap.classReducedCount,
-            &pDexFile->indexMap.classMap))
-    {
-        return false;
-    }
-
-    if (!parseIndexMapEntry(&data, &size, expanding,
-            &pDexFile->indexMap.methodFullCount,
-            &pDexFile->indexMap.methodReducedCount,
-            &pDexFile->indexMap.methodMap))
-    {
-        return false;
-    }
-
-    if (!parseIndexMapEntry(&data, &size, expanding,
-            &pDexFile->indexMap.fieldFullCount,
-            &pDexFile->indexMap.fieldReducedCount,
-            &pDexFile->indexMap.fieldMap))
-    {
-        return false;
-    }
-
-    if (!parseIndexMapEntry(&data, &size, expanding,
-            &pDexFile->indexMap.stringFullCount,
-            &pDexFile->indexMap.stringReducedCount,
-            &pDexFile->indexMap.stringMap))
-    {
-        return false;
-    }
-
-    if (expanding) {
-        /*
-         * The map includes the "reduced" counts; pull the original counts
-         * out of the DexFile so that code has a consistent source.
-         */
-        assert(pDexFile->indexMap.classFullCount == (u4) -1);
-        assert(pDexFile->indexMap.methodFullCount == (u4) -1);
-        assert(pDexFile->indexMap.fieldFullCount == (u4) -1);
-        assert(pDexFile->indexMap.stringFullCount == (u4) -1);
-
-#if 0   // TODO: not available yet -- do later or just skip this
-        pDexFile->indexMap.classFullCount =
-            pDexFile->pHeader->typeIdsSize;
-        pDexFile->indexMap.methodFullCount =
-            pDexFile->pHeader->methodIdsSize;
-        pDexFile->indexMap.fieldFullCount =
-            pDexFile->pHeader->fieldIdsSize;
-        pDexFile->indexMap.stringFullCount =
-            pDexFile->pHeader->stringIdsSize;
-#endif
-    }
-
-    LOGI("Class : %u %u %u\n",
-        pDexFile->indexMap.classFullCount,
-        pDexFile->indexMap.classReducedCount,
-        pDexFile->indexMap.classMap[0]);
-    LOGI("Method: %u %u %u\n",
-        pDexFile->indexMap.methodFullCount,
-        pDexFile->indexMap.methodReducedCount,
-        pDexFile->indexMap.methodMap[0]);
-    LOGI("Field : %u %u %u\n",
-        pDexFile->indexMap.fieldFullCount,
-        pDexFile->indexMap.fieldReducedCount,
-        pDexFile->indexMap.fieldMap[0]);
-    LOGI("String: %u %u %u\n",
-        pDexFile->indexMap.stringFullCount,
-        pDexFile->indexMap.stringReducedCount,
-        pDexFile->indexMap.stringMap[0]);
-
-    return true;
-}
-
-/*
- * Parse some auxillary data tables.
- *
- * v1.0 wrote a zero in the first 32 bits, followed by the DexClassLookup
- * table.  Subsequent versions switched to the "chunk" format.
- */
-static bool parseAuxData(const u1* data, DexFile* pDexFile)
-{
-    const u4* pAux = (const u4*) (data + pDexFile->pOptHeader->auxOffset);
-    u4 indexMapType = 0;
-
-    /* v1.0 format? */
-    if (*pAux == 0) {
-        LOGV("+++ found OLD dex format\n");
-        pDexFile->pClassLookup = (const DexClassLookup*) (pAux+1);
-        return true;
-    }
-    LOGV("+++ found NEW dex format\n");
-
-    /* process chunks until we see the end marker */
-    while (*pAux != kDexChunkEnd) {
-        u4 size = *(pAux+1);
-        u1* data = (u1*) (pAux + 2);
-
-        switch (*pAux) {
-        case kDexChunkClassLookup:
-            pDexFile->pClassLookup = (const DexClassLookup*) data;
-            break;
-        case kDexChunkReducingIndexMap:
-            LOGI("+++ found reducing index map, size=%u\n", size);
-            if (!parseIndexMap(pDexFile, data, size, false)) {
-                LOGE("Failed parsing reducing index map\n");
-                return false;
-            }
-            indexMapType = *pAux;
-            break;
-        case kDexChunkExpandingIndexMap:
-            LOGI("+++ found expanding index map, size=%u\n", size);
-            if (!parseIndexMap(pDexFile, data, size, true)) {
-                LOGE("Failed parsing expanding index map\n");
-                return false;
-            }
-            indexMapType = *pAux;
-            break;
-        case kDexChunkRegisterMaps:
-            LOGV("+++ found register maps, size=%u\n", size);
-            pDexFile->pRegisterMapPool = data;
-            break;
-        default:
-            LOGI("Unknown chunk 0x%08x (%c%c%c%c), size=%d in aux data area\n",
-                *pAux,
-                (char) ((*pAux) >> 24), (char) ((*pAux) >> 16),
-                (char) ((*pAux) >> 8),  (char)  (*pAux),
-                size);
-            break;
-        }
-
-        /*
-         * Advance pointer, padding to 64-bit boundary.  The extra "+8" is
-         * for the type/size header.
-         */
-        size = (size + 8 + 7) & ~7;
-        pAux += size / sizeof(u4);
-    }
-
-#if 0   // TODO: propagate expected map type from the VM through the API
-    /*
-     * If we're configured to expect an index map, and we don't find one,
-     * reject this DEX so we'll regenerate it.  Also, if we found an
-     * "expanding" map but we're not configured to use it, we have to fail
-     * because the constants aren't usable without translation.
-     */
-    if (indexMapType != expectedIndexMapType) {
-        LOGW("Incompatible index map configuration: found 0x%04x, need %d\n",
-            indexMapType, DVM_REDUCE_CONSTANTS);
-        return false;
-    }
-#endif
-
-    return true;
 }
 
 /*
@@ -725,8 +516,8 @@ DexFile* dexFileParse(const u1* data, size_t length, int flags)
         LOGV("Good opt header, DEX offset is %d, flags=0x%02x\n",
             pDexFile->pOptHeader->dexOffset, pDexFile->pOptHeader->flags);
 
-        /* locate some auxillary data tables */
-        if (!parseAuxData(data, pDexFile))
+        /* parse the optimized dex file tables */
+        if (!dexParseOptData(data, length, pDexFile))
             goto bail;
 
         /* ignore the opt header and appended data from here on out */
@@ -877,7 +668,7 @@ const DexClassDef* dexFindClass(const DexFile* pDexFile,
 
         if (pLookup->table[idx].classDescriptorHash == hash) {
             const char* str;
-        
+
             str = (const char*) (pDexFile->baseAddr + offset);
             if (strcmp(str, descriptor) == 0) {
                 return (const DexClassDef*)
@@ -902,21 +693,6 @@ u4 dexComputeChecksum(const DexHeader* pHeader)
 
     return (u4) adler32(adler, start + nonSum, pHeader->fileSize - nonSum);
 }
-
-/*
- * Compute the checksum on the data appended to the DEX file by dexopt.
- */
-static u4 dexComputeOptChecksum(const DexOptHeader* pOptHeader)
-{
-    const u1* start = (const u1*) pOptHeader + pOptHeader->depsOffset;
-    const u1* end = (const u1*) pOptHeader +
-        pOptHeader->auxOffset + pOptHeader->auxLength;
-
-    uLong adler = adler32(0L, Z_NULL, 0);
-
-    return (u4) adler32(adler, start, end - start);
-}
-
 
 /*
  * Compute the size, in bytes, of a DexCode.
@@ -1017,7 +793,7 @@ static int typeLength (const char *type) {
  * Reads a string index as encoded for the debug info format,
  * returning a string pointer or NULL as appropriate.
  */
-static const char* readStringIdx(const DexFile* pDexFile, 
+static const char* readStringIdx(const DexFile* pDexFile,
         const u1** pStream) {
     u4 stringIdx = readUnsignedLeb128(pStream);
 
@@ -1033,7 +809,7 @@ static const char* readStringIdx(const DexFile* pDexFile,
  * Reads a type index as encoded for the debug info format, returning
  * a string pointer for its descriptor or NULL as appropriate.
  */
-static const char* readTypeIdx(const DexFile* pDexFile, 
+static const char* readTypeIdx(const DexFile* pDexFile,
         const u1** pStream) {
     u4 typeIdx = readUnsignedLeb128(pStream);
 
@@ -1056,14 +832,14 @@ typedef struct LocalInfo {
     bool live;
 } LocalInfo;
 
-static void emitLocalCbIfLive (void *cnxt, int reg, u4 endAddress, 
+static void emitLocalCbIfLive (void *cnxt, int reg, u4 endAddress,
         LocalInfo *localInReg, DexDebugNewLocalCb localCb)
 {
     if (localCb != NULL && localInReg[reg].live) {
         localCb(cnxt, reg, localInReg[reg].startAddress, endAddress,
-                localInReg[reg].name, 
-                localInReg[reg].descriptor, 
-                localInReg[reg].signature == NULL 
+                localInReg[reg].name,
+                localInReg[reg].descriptor,
+                localInReg[reg].signature == NULL
                 ? "" : localInReg[reg].signature );
     }
 }
@@ -1113,7 +889,7 @@ void dexDecodeDebugInfo(
     } else {
         assert(pCode->insSize == dexProtoComputeArgsSize(&proto));
     }
-    
+
     DexParameterIterator iterator;
     dexParameterIteratorInit(&iterator, &proto);
 
@@ -1121,7 +897,7 @@ void dexDecodeDebugInfo(
         const char* descriptor = dexParameterIteratorNextDescriptor(&iterator);
         const char *name;
         int reg;
-        
+
         if ((argReg >= pCode->registersSize) || (descriptor == NULL)) {
             goto invalid_stream;
         }
@@ -1159,7 +935,7 @@ void dexDecodeDebugInfo(
             case DBG_ADVANCE_PC:
                 address += readUnsignedLeb128(&stream);
                 break;
-                
+
             case DBG_ADVANCE_LINE:
                 line += readSignedLeb128(&stream);
                 break;
@@ -1170,13 +946,13 @@ void dexDecodeDebugInfo(
                 if (reg > pCode->registersSize) goto invalid_stream;
 
                 // Emit what was previously there, if anything
-                emitLocalCbIfLive (cnxt, reg, address, 
+                emitLocalCbIfLive (cnxt, reg, address,
                     localInReg, localCb);
 
                 localInReg[reg].name = readStringIdx(pDexFile, &stream);
                 localInReg[reg].descriptor = readTypeIdx(pDexFile, &stream);
                 if (opcode == DBG_START_LOCAL_EXTENDED) {
-                    localInReg[reg].signature 
+                    localInReg[reg].signature
                         = readStringIdx(pDexFile, &stream);
                 } else {
                     localInReg[reg].signature = NULL;
@@ -1197,7 +973,7 @@ void dexDecodeDebugInfo(
                 reg = readUnsignedLeb128(&stream);
                 if (reg > pCode->registersSize) goto invalid_stream;
 
-                if (localInReg[reg].name == NULL 
+                if (localInReg[reg].name == NULL
                         || localInReg[reg].descriptor == NULL) {
                     goto invalid_stream;
                 }
@@ -1224,7 +1000,7 @@ void dexDecodeDebugInfo(
                 line += DBG_LINE_BASE + (adjopcode % DBG_LINE_RANGE);
 
                 if (posCb != NULL) {
-                    int done; 
+                    int done;
                     done = posCb(cnxt, address, line);
 
                     if (done) {
@@ -1254,4 +1030,3 @@ invalid_stream:
         free(methodDescriptor);
     }
 }
-

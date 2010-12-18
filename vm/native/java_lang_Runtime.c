@@ -19,7 +19,8 @@
  */
 #include "Dalvik.h"
 #include "native/InternalNativePriv.h"
-
+#include <unistd.h>
+#include <limits.h>
 
 /*
  * public void gc()
@@ -60,27 +61,35 @@ static void Dalvik_java_lang_Runtime_nativeExit(const u4* args,
 }
 
 /*
- * static boolean nativeLoad(String filename, ClassLoader loader)
+ * static String nativeLoad(String filename, ClassLoader loader)
  *
  * Load the specified full path as a dynamic library filled with
- * JNI-compatible methods.
+ * JNI-compatible methods. Returns null on success, or a failure
+ * message on failure.
  */
 static void Dalvik_java_lang_Runtime_nativeLoad(const u4* args,
     JValue* pResult)
 {
     StringObject* fileNameObj = (StringObject*) args[0];
     Object* classLoader = (Object*) args[1];
-    char* fileName;
-    int result;
+    char* fileName = NULL;
+    StringObject* result = NULL;
+    char* reason = NULL;
+    bool success;
 
-    if (fileNameObj == NULL)
-        RETURN_INT(false);
+    assert(fileNameObj != NULL);
     fileName = dvmCreateCstrFromString(fileNameObj);
 
-    result = dvmLoadNativeCode(fileName, classLoader);
+    success = dvmLoadNativeCode(fileName, classLoader, &reason);
+    if (!success) {
+        const char* msg = (reason != NULL) ? reason : "unknown failure";
+        result = dvmCreateStringFromCstr(msg);
+        dvmReleaseTrackedAlloc((Object*) result, NULL);
+    }
 
+    free(reason);
     free(fileName);
-    RETURN_INT(result);
+    RETURN_PTR(result);
 }
 
 /*
@@ -108,6 +117,26 @@ static void Dalvik_java_lang_Runtime_runFinalization(const u4* args,
     RETURN_VOID();
 }
 
+/*
+ * public int availableProcessors()
+ *
+ * Returns the number of online processors, at least one.
+ *
+ */
+static void Dalvik_java_lang_Runtime_availableProcessors(const u4* args,
+    JValue* pResult)
+{
+    long result = 1;
+#ifdef _SC_NPROCESSORS_ONLN
+    result = sysconf(_SC_NPROCESSORS_ONLN);
+    if (result > INT_MAX) {
+        result = INT_MAX;
+    } else if (result < 1 ) {
+        result = 1;
+    }
+#endif
+    RETURN_INT((int)result);
+}
 /*
  * public void maxMemory()
  *
@@ -152,11 +181,13 @@ const DalvikNativeMethod dvm_java_lang_Runtime[] = {
         Dalvik_java_lang_Runtime_freeMemory },
     { "gc",                 "()V",
         Dalvik_java_lang_Runtime_gc },
+    { "availableProcessors", "()I",
+        Dalvik_java_lang_Runtime_availableProcessors },
     { "maxMemory",          "()J",
         Dalvik_java_lang_Runtime_maxMemory },
     { "nativeExit",         "(IZ)V",
         Dalvik_java_lang_Runtime_nativeExit },
-    { "nativeLoad",         "(Ljava/lang/String;Ljava/lang/ClassLoader;)Z",
+    { "nativeLoad",         "(Ljava/lang/String;Ljava/lang/ClassLoader;)Ljava/lang/String;",
         Dalvik_java_lang_Runtime_nativeLoad },
     { "runFinalization",    "(Z)V",
         Dalvik_java_lang_Runtime_runFinalization },

@@ -251,13 +251,18 @@ void dvmCheckCallJNIMethod_staticNoRef(const u4* args, JValue* pResult,
     checkNonNull(_env, _ptr, __FUNCTION__)
 #define CHECK_SIG(_env, _methid, _sigbyte, _isstatic)                       \
     checkSig(_env, _methid, _sigbyte, _isstatic, __FUNCTION__)
+#define CHECK_VIRTUAL_METHOD(_env, _obj, _methid)                           \
+    checkVirtualMethod(_env, _obj, _methid, __FUNCTION__)
+#define CHECK_STATIC_METHOD(_env, _clazz, _methid)                          \
+    checkStaticMethod(_env, _clazz, _methid, __FUNCTION__)
 #define CHECK_METHOD_ARGS_A(_env, _methid, _args)                           \
     checkMethodArgsA(_env, _methid, _args, __FUNCTION__)
 #define CHECK_METHOD_ARGS_V(_env, _methid, _args)                           \
     checkMethodArgsV(_env, _methid, _args, __FUNCTION__)
 
 /*
- * Print trace message when both "checkJNI" and "verbose:jni" are enabled.
+ * Prints trace messages when a native method calls a JNI function such as
+ * NewByteArray. Enabled if both "-Xcheck:jni" and "-verbose:jni" are enabled.
  */
 #define JNI_TRACE(_entry, _hasmeth)                                         \
     do {                                                                    \
@@ -530,17 +535,18 @@ static void checkClass(JNIEnv* env, jclass jclazz, const char* func)
     JNI_ENTER();
     bool printWarn = false;
 
-    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(env, jclazz);
+    Object* obj = dvmDecodeIndirectRef(env, jclazz);
 
-    if (clazz == NULL) {
+    if (obj == NULL) {
         LOGW("JNI WARNING: received null jclass\n");
         printWarn = true;
-    } else if (!dvmIsValidObject((Object*) clazz)) {
-        LOGW("JNI WARNING: jclass points to invalid object %p\n", clazz);
+    } else if (!dvmIsValidObject(obj)) {
+        LOGW("JNI WARNING: jclass points to invalid object %p\n", obj);
         printWarn = true;
-    } else if (clazz->obj.clazz != gDvm.classJavaLangClass) {
-        LOGW("JNI WARNING: jclass does not point to class object (%p - %s)\n",
-            jclazz, clazz->descriptor);
+    } else if (obj->clazz != gDvm.classJavaLangClass) {
+        LOGW("JNI WARNING: jclass arg is not a Class reference "
+             "(%p is instance of %s)\n",
+            jclazz, obj->clazz->descriptor);
         printWarn = true;
     }
     JNI_EXIT();
@@ -804,7 +810,7 @@ static void checkSig(JNIEnv* env, jmethodID methodID, char expectedSigByte,
 static void checkStaticFieldID(JNIEnv* env, jclass jclazz, jfieldID fieldID)
 {
     ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(env, jclazz);
-    StaticField* base = clazz->sfields;
+    StaticField* base = &clazz->sfields[0];
     int fieldCount = clazz->sfieldCount;
 
     if ((StaticField*) fieldID < base ||
@@ -857,6 +863,56 @@ bail:
 }
 
 /*
+ * Verify that "methodID" is appropriate for "jobj".
+ *
+ * Make sure the object is an instance of the method's declaring class.
+ * (Note the methodID might point to a declaration in an interface; this
+ * will be handled automatically by the instanceof check.)
+ */
+static void checkVirtualMethod(JNIEnv* env, jobject jobj, jmethodID methodID,
+    const char* func)
+{
+    JNI_ENTER();
+
+    Object* obj = dvmDecodeIndirectRef(env, jobj);
+    const Method* meth = (const Method*) methodID;
+
+    if (!dvmInstanceof(obj->clazz, meth->clazz)) {
+        LOGW("JNI WARNING: can't call %s.%s on instance of %s\n",
+            meth->clazz->descriptor, meth->name, obj->clazz->descriptor);
+        abortMaybe();
+    }
+
+    JNI_EXIT();
+}
+
+/*
+ * Verify that "methodID" is appropriate for "clazz".
+ *
+ * A mismatch isn't dangerous, because the method defines the class.  In
+ * fact, jclazz is unused in the implementation.  It's best if we don't
+ * allow bad code in the system though.
+ *
+ * Instances of "jclazz" must be instances of the method's declaring class.
+ */
+static void checkStaticMethod(JNIEnv* env, jclass jclazz, jmethodID methodID,
+    const char* func)
+{
+    JNI_ENTER();
+
+    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(env, jclazz);
+    const Method* meth = (const Method*) methodID;
+
+    if (!dvmInstanceof(clazz, meth->clazz)) {
+        LOGW("JNI WARNING: can't call static %s.%s on class %s\n",
+            meth->clazz->descriptor, meth->name, clazz->descriptor);
+        // no abort
+    }
+
+    JNI_EXIT();
+}
+
+/*
  * Verify that the reference arguments being passed in are appropriate for
  * this method.
  *
@@ -878,7 +934,6 @@ static void checkMethodArgsV(JNIEnv* env, jmethodID methodID, va_list args,
 
     const Method* meth = (const Method*) methodID;
     const char* desc = meth->shorty;
-    ClassObject* clazz;
 
     LOGV("V-checking %s.%s:%s...\n", meth->clazz->descriptor, meth->name, desc);
 
@@ -901,7 +956,6 @@ static void checkMethodArgsV(JNIEnv* env, jmethodID methodID, va_list args,
         }
     }
 
-bail:
     JNI_EXIT();
 #endif
 }
@@ -918,7 +972,6 @@ static void checkMethodArgsA(JNIEnv* env, jmethodID methodID, jvalue* args,
 
     const Method* meth = (const Method*) methodID;
     const char* desc = meth->shorty;
-    ClassObject* clazz;
     int idx = 0;
 
     LOGV("A-checking %s.%s:%s...\n", meth->clazz->descriptor, meth->name, desc);
@@ -932,7 +985,6 @@ static void checkMethodArgsA(JNIEnv* env, jmethodID methodID, jvalue* args,
         idx++;
     }
 
-bail:
     JNI_EXIT();
 #endif
 }
@@ -1174,8 +1226,6 @@ static void* releaseGuardedPACopy(JNIEnv* env, jarray jarr, void* dataBuf,
     int mode)
 {
     ArrayObject* arrObj = (ArrayObject*) dvmDecodeIndirectRef(env, jarr);
-    PrimitiveType primType = arrObj->obj.clazz->elementClass->primitiveType;
-    //int len = array->length * dvmPrimitiveTypeWidth(primType);
     bool release, copyBack;
     u1* result;
 
@@ -1702,6 +1752,7 @@ SET_TYPE_FIELD(jdouble, Double, PRIM_DOUBLE);
         CHECK_ENTER(env, kFlag_Default);                                    \
         CHECK_OBJECT(env, obj);                                             \
         CHECK_SIG(env, methodID, _retsig, false);                           \
+        CHECK_VIRTUAL_METHOD(env, obj, methodID);                           \
         _retdecl;                                                           \
         va_list args, tmpArgs;                                              \
         va_start(args, methodID);                                           \
@@ -1720,6 +1771,7 @@ SET_TYPE_FIELD(jdouble, Double, PRIM_DOUBLE);
         CHECK_ENTER(env, kFlag_Default);                                    \
         CHECK_OBJECT(env, obj);                                             \
         CHECK_SIG(env, methodID, _retsig, false);                           \
+        CHECK_VIRTUAL_METHOD(env, obj, methodID);                           \
         _retdecl;                                                           \
         va_list tmpArgs;                                                    \
         va_copy(tmpArgs, args);                                             \
@@ -1736,6 +1788,7 @@ SET_TYPE_FIELD(jdouble, Double, PRIM_DOUBLE);
         CHECK_ENTER(env, kFlag_Default);                                    \
         CHECK_OBJECT(env, obj);                                             \
         CHECK_SIG(env, methodID, _retsig, false);                           \
+        CHECK_VIRTUAL_METHOD(env, obj, methodID);                           \
         _retdecl;                                                           \
         CHECK_METHOD_ARGS_A(env, methodID, args);                           \
         _retasgn BASE_ENV(env)->Call##_jname##MethodA(env, obj, methodID,   \
@@ -1763,6 +1816,7 @@ CALL_VIRTUAL(void, Void, , , , 'V');
         CHECK_CLASS(env, clazz);                                            \
         CHECK_OBJECT(env, obj);                                             \
         CHECK_SIG(env, methodID, _retsig, false);                           \
+        CHECK_VIRTUAL_METHOD(env, obj, methodID);                           \
         _retdecl;                                                           \
         va_list args, tmpArgs;                                              \
         va_start(args, methodID);                                           \
@@ -1782,6 +1836,7 @@ CALL_VIRTUAL(void, Void, , , , 'V');
         CHECK_CLASS(env, clazz);                                            \
         CHECK_OBJECT(env, obj);                                             \
         CHECK_SIG(env, methodID, _retsig, false);                           \
+        CHECK_VIRTUAL_METHOD(env, obj, methodID);                           \
         _retdecl;                                                           \
         va_list tmpArgs;                                                    \
         va_copy(tmpArgs, args);                                             \
@@ -1799,6 +1854,7 @@ CALL_VIRTUAL(void, Void, , , , 'V');
         CHECK_CLASS(env, clazz);                                            \
         CHECK_OBJECT(env, obj);                                             \
         CHECK_SIG(env, methodID, _retsig, false);                           \
+        CHECK_VIRTUAL_METHOD(env, obj, methodID);                           \
         _retdecl;                                                           \
         CHECK_METHOD_ARGS_A(env, methodID, args);                           \
         _retasgn BASE_ENV(env)->CallNonvirtual##_jname##MethodA(env, obj,   \
@@ -1825,6 +1881,7 @@ CALL_NONVIRTUAL(void, Void, , , , 'V');
         CHECK_ENTER(env, kFlag_Default);                                    \
         CHECK_CLASS(env, clazz);                                            \
         CHECK_SIG(env, methodID, _retsig, true);                            \
+        CHECK_STATIC_METHOD(env, clazz, methodID);                          \
         _retdecl;                                                           \
         va_list args, tmpArgs;                                              \
         va_start(args, methodID);                                           \
@@ -1843,6 +1900,7 @@ CALL_NONVIRTUAL(void, Void, , , , 'V');
         CHECK_ENTER(env, kFlag_Default);                                    \
         CHECK_CLASS(env, clazz);                                            \
         CHECK_SIG(env, methodID, _retsig, true);                            \
+        CHECK_STATIC_METHOD(env, clazz, methodID);                          \
         _retdecl;                                                           \
         va_list tmpArgs;                                                    \
         va_copy(tmpArgs, args);                                             \
@@ -1859,6 +1917,7 @@ CALL_NONVIRTUAL(void, Void, , , , 'V');
         CHECK_ENTER(env, kFlag_Default);                                    \
         CHECK_CLASS(env, clazz);                                            \
         CHECK_SIG(env, methodID, _retsig, true);                            \
+        CHECK_STATIC_METHOD(env, clazz, methodID);                          \
         _retdecl;                                                           \
         CHECK_METHOD_ARGS_A(env, methodID, args);                           \
         _retasgn BASE_ENV(env)->CallStatic##_jname##MethodA(env, clazz,     \

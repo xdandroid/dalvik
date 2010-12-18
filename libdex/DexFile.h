@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 /*
  * Access .dex (Dalvik Executable Format) files.  The code here assumes that
  * the DEX file has been rewritten (byte-swapped, word-aligned) and that
@@ -28,6 +29,7 @@
  *
  * All memory-mapped structures are 32-bit aligned unless otherwise noted.
  */
+
 #ifndef _LIBDEX_DEXFILE
 #define _LIBDEX_DEXFILE
 
@@ -70,7 +72,7 @@ enum {
 
 /*
  * access flags and masks; the "standard" ones are all <= 0x4000
- * 
+ *
  * Note: There are related declarations in vm/oo/Object.h in the ClassFlags
  * enum.
  */
@@ -96,7 +98,7 @@ enum {
     ACC_CONSTRUCTOR  = 0x00010000,       // method (Dalvik only)
     ACC_DECLARED_SYNCHRONIZED =
                        0x00020000,       // method (Dalvik only)
-    ACC_CLASS_MASK = 
+    ACC_CLASS_MASK =
         (ACC_PUBLIC | ACC_FINAL | ACC_INTERFACE | ACC_ABSTRACT
                 | ACC_SYNTHETIC | ACC_ANNOTATION | ACC_ENUM),
     ACC_INNER_CLASS_MASK =
@@ -164,9 +166,6 @@ enum {
 enum {
     kDexChunkClassLookup            = 0x434c4b50,   /* CLKP */
     kDexChunkRegisterMaps           = 0x524d4150,   /* RMAP */
-
-    kDexChunkReducingIndexMap       = 0x5249584d,   /* RIXM */
-    kDexChunkExpandingIndexMap      = 0x4549584d,   /* EIXM */
 
     kDexChunkEnd                    = 0x41454e44,   /* AEND */
 };
@@ -442,30 +441,6 @@ typedef struct DexClassLookup {
 } DexClassLookup;
 
 /*
- * Map constant pool indices from one form to another.  Some or all of these
- * may be NULL.
- *
- * The map values are 16-bit unsigned values.  If the values we map to
- * require a larger range, we omit the mapping for that category (which
- * requires that the lookup code recognize that the data will not be
- * there for all DEX files in all categories.)
- */
-typedef struct DexIndexMap {
-    const u2* classMap;         /* map, either expanding or reducing */
-    u4  classFullCount;         /* same as typeIdsSize */
-    u4  classReducedCount;      /* post-reduction count */
-    const u2* methodMap;
-    u4  methodFullCount;
-    u4  methodReducedCount;
-    const u2* fieldMap;
-    u4  fieldFullCount;
-    u4  fieldReducedCount;
-    const u2* stringMap;
-    u4  stringFullCount;
-    u4  stringReducedCount;
-} DexIndexMap;
-
-/*
  * Header added by DEX optimization pass.  Values are always written in
  * local byte and structure padding.  The first field (magic + version)
  * is guaranteed to be present and directly readable for all expected
@@ -480,11 +455,11 @@ typedef struct DexOptHeader {
     u4  dexLength;
     u4  depsOffset;         /* offset of optimized DEX dependency table */
     u4  depsLength;
-    u4  auxOffset;          /* file offset of pre-calc auxillary data */
-    u4  auxLength;
+    u4  optOffset;          /* file offset of optimized data tables */
+    u4  optLength;
 
     u4  flags;              /* some info flags */
-    u4  checksum;           /* adler32 checksum covering deps/aux */
+    u4  checksum;           /* adler32 checksum covering deps/opt */
 
     /* pad for 64-bit alignment if necessary */
 } DexOptHeader;
@@ -521,7 +496,6 @@ typedef struct DexFile {
      * included in the file.
      */
     const DexClassLookup* pClassLookup;
-    DexIndexMap         indexMap;
     const void*         pRegisterMapPool;       // RegisterMapClassPool
 
     /* points to start of DEX file data */
@@ -554,12 +528,23 @@ enum {
 };
 
 /*
- * Correct the byte ordering in a memory-mapped DEX file.  This is only
- * required for code that opens "raw" DEX files, such as the DEX optimizer.
+ * Fix the byte ordering of all fields in the DEX file, and do
+ * structural verification. This is only required for code that opens
+ * "raw" DEX files, such as the DEX optimizer.
  *
  * Return 0 on success.
  */
-int dexFixByteOrdering(u1* addr, int len);
+int dexSwapAndVerify(u1* addr, int len);
+
+/*
+ * Detect the file type of the given memory buffer via magic number.
+ * Call dexSwapAndVerify() on an unoptimized DEX file, do nothing
+ * but return successfully on an optimized DEX file, and report an
+ * error for all other cases.
+ *
+ * Return 0 on success.
+ */
+int dexSwapAndVerifyIfNecessary(u1* addr, int len);
 
 /*
  * Compute DEX checksum.
@@ -747,7 +732,7 @@ DEX_INLINE const DexTry* dexGetTries(const DexCode* pCode) {
     if ((((u4) insnsEnd) & 3) != 0) {
         insnsEnd++;
     }
-    
+
     return (const DexTry*) insnsEnd;
 }
 
@@ -784,7 +769,7 @@ typedef void (*DexDebugNewLocalCb)(void *cnxt, u2 reg, u4 startAddress,
 
 /*
  * Decode debug info for method.
- * 
+ *
  * posCb is called in ascending address order.
  * localCb is called in order of ascending end address.
  */

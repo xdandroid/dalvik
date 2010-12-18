@@ -15,7 +15,7 @@
  */
 
 #include <cutils/mspace.h>
-#include <limits.h>     // for INT_MAX
+#include <stdint.h>     // for SIZE_MAX
 #include <sys/mman.h>
 #include <errno.h>
 
@@ -41,6 +41,16 @@ static void setIdealFootprint(size_t max);
 #define DEFAULT_HEAP_UTILIZATION    512     // Range 1..HEAP_UTILIZATION_MAX
 #define HEAP_IDEAL_FREE             (2 * 1024 * 1024)
 #define HEAP_MIN_FREE               (HEAP_IDEAL_FREE / 4)
+
+/* Start a concurrent collection when free memory falls under this
+ * many bytes.
+ */
+#define CONCURRENT_START (128 << 10)
+
+/* The next GC will not be concurrent when free memory after a GC is
+ * under this many bytes.
+ */
+#define CONCURRENT_MIN_FREE (CONCURRENT_START + (128 << 10))
 
 #define HS_BOILERPLATE() \
     do { \
@@ -99,10 +109,6 @@ typedef struct {
      */
     mspace msp;
 
-    /* The bitmap that keeps track of where objects are in the heap.
-     */
-    HeapBitmap objectBitmap;
-
     /* The largest size that this heap is allowed to grow to.
      */
     size_t absoluteMaxSize;
@@ -113,9 +119,24 @@ typedef struct {
      */
     size_t bytesAllocated;
 
+    /* Number of bytes allocated from this mspace at which a
+     * concurrent garbage collection will be started.
+     */
+    size_t concurrentStartBytes;
+
     /* Number of objects currently allocated from this mspace.
      */
     size_t objectsAllocated;
+
+    /*
+     * The lowest address of this heap, inclusive.
+     */
+    char *base;
+
+    /*
+     * The highest address of this heap, exclusive.
+     */
+    char *limit;
 } Heap;
 
 struct HeapSource {
@@ -165,6 +186,35 @@ struct HeapSource {
     /* True if zygote mode was active when the HeapSource was created.
      */
     bool sawZygote;
+
+    /*
+     * The base address of the virtual memory reservation.
+     */
+    char *heapBase;
+
+    /*
+     * The length in bytes of the virtual memory reservation.
+     */
+    size_t heapLength;
+
+    /*
+     * The live object bitmap.
+     */
+    HeapBitmap liveBits;
+
+    /*
+     * The mark bitmap.
+     */
+    HeapBitmap markBits;
+
+    /*
+     * State for the GC daemon.
+     */
+    bool hasGcThread;
+    pthread_t gcThread;
+    bool gcThreadShutdown;
+    pthread_mutex_t gcThreadMutex;
+    pthread_cond_t gcThreadCond;
 };
 
 #define hs2heap(hs_) (&((hs_)->heaps[0]))
@@ -175,13 +225,27 @@ struct HeapSource {
 static inline bool
 softLimited(const HeapSource *hs)
 {
-    /* softLimit will be either INT_MAX or the limit for the
+    /* softLimit will be either SIZE_MAX or the limit for the
      * active mspace.  idealSize can be greater than softLimit
      * if there is more than one heap.  If there is only one
-     * heap, a non-INT_MAX softLimit should always be the same
+     * heap, a non-SIZE_MAX softLimit should always be the same
      * as idealSize.
      */
     return hs->softLimit <= hs->idealSize;
+}
+
+/*
+ * Returns approximately the maximum number of bytes allowed to be
+ * allocated from the active heap before a GC is forced.
+ */
+static size_t
+getAllocLimit(const HeapSource *hs)
+{
+    if (softLimited(hs)) {
+        return hs->softLimit;
+    } else {
+        return mspace_max_allowed_footprint(hs2heap(hs)->msp);
+    }
 }
 
 /*
@@ -220,8 +284,8 @@ ptr2heap(const HeapSource *hs, const void *ptr)
     if (ptr != NULL) {
         for (i = 0; i < numHeaps; i++) {
             const Heap *const heap = &hs->heaps[i];
-            
-            if (dvmHeapBitmapMayContainObject(&heap->objectBitmap, ptr)) {
+
+            if ((const char *)ptr >= heap->base && (const char *)ptr < heap->limit) {
                 return (Heap *)heap;
             }
         }
@@ -237,24 +301,26 @@ ptr2heap(const HeapSource *hs, const void *ptr)
  *
  * These aren't exact, and should not be treated as such.
  */
-static inline void
-countAllocation(Heap *heap, const void *ptr, bool isObj)
+static void countAllocation(Heap *heap, const void *ptr, bool isObj)
 {
+    HeapSource *hs;
+
     assert(heap->bytesAllocated < mspace_footprint(heap->msp));
 
     heap->bytesAllocated += mspace_usable_size(heap->msp, ptr) +
             HEAP_SOURCE_CHUNK_OVERHEAD;
     if (isObj) {
         heap->objectsAllocated++;
-        dvmHeapBitmapSetObjectBit(&heap->objectBitmap, ptr);
+        hs = gDvm.gcHeap->heapSource;
+        dvmHeapBitmapSetObjectBit(&hs->liveBits, ptr);
     }
 
     assert(heap->bytesAllocated < mspace_footprint(heap->msp));
 }
 
-static inline void
-countFree(Heap *heap, const void *ptr, bool isObj)
+static void countFree(Heap *heap, const void *ptr, size_t *numBytes)
 {
+    HeapSource *hs;
     size_t delta;
 
     delta = mspace_usable_size(heap->msp, ptr) + HEAP_SOURCE_CHUNK_OVERHEAD;
@@ -264,28 +330,20 @@ countFree(Heap *heap, const void *ptr, bool isObj)
     } else {
         heap->bytesAllocated = 0;
     }
-    if (isObj) {
-        dvmHeapBitmapClearObjectBit(&heap->objectBitmap, ptr);
-        if (heap->objectsAllocated > 0) {
-            heap->objectsAllocated--;
-        }
+    hs = gDvm.gcHeap->heapSource;
+    dvmHeapBitmapClearObjectBit(&hs->liveBits, ptr);
+    if (heap->objectsAllocated > 0) {
+        heap->objectsAllocated--;
     }
+    *numBytes += delta;
 }
 
 static HeapSource *gHs = NULL;
 
 static mspace
-createMspace(size_t startSize, size_t absoluteMaxSize, size_t id)
+createMspace(void *base, size_t startSize, size_t absoluteMaxSize)
 {
     mspace msp;
-    char name[PATH_MAX];
-
-    /* If two ashmem regions have the same name, only one gets
-     * the name when looking at the maps.
-     */
-    snprintf(name, sizeof(name)-1, "dalvik-heap%s/%zd",
-        gDvm.zygote ? "/zygote" : "", id);
-    name[sizeof(name)-1] = '\0';
 
     /* Create an unlocked dlmalloc mspace to use as
      * a small-object heap source.
@@ -297,8 +355,8 @@ createMspace(size_t startSize, size_t absoluteMaxSize, size_t id)
      */
     LOGV_HEAP("Creating VM heap of size %u\n", startSize);
     errno = 0;
-    msp = create_contiguous_mspace_with_name(startSize/2,
-            absoluteMaxSize, /*locked=*/false, name);
+    msp = create_contiguous_mspace_with_base(startSize/2,
+            absoluteMaxSize, /*locked=*/false, base);
     if (msp != NULL) {
         /* Don't let the heap grow past the starting size without
          * our intervention.
@@ -308,8 +366,8 @@ createMspace(size_t startSize, size_t absoluteMaxSize, size_t id)
         /* There's no guarantee that errno has meaning when the call
          * fails, but it often does.
          */
-        LOGE_HEAP("Can't create VM heap of size (%u,%u) (errno=%d)\n",
-            startSize/2, absoluteMaxSize, errno);
+        LOGE_HEAP("Can't create VM heap of size (%u,%u): %s\n",
+            startSize/2, absoluteMaxSize, strerror(errno));
     }
 
     return msp;
@@ -332,30 +390,31 @@ addNewHeap(HeapSource *hs, mspace msp, size_t mspAbsoluteMaxSize)
     if (msp != NULL) {
         heap.msp = msp;
         heap.absoluteMaxSize = mspAbsoluteMaxSize;
+        heap.concurrentStartBytes = SIZE_MAX;
+        heap.base = hs->heapBase;
+        heap.limit = hs->heapBase + heap.absoluteMaxSize;
     } else {
-        size_t overhead;
+        void *sbrk0 = contiguous_mspace_sbrk0(hs->heaps[0].msp);
+        char *base = (char *)ALIGN_UP_TO_PAGE_SIZE(sbrk0);
+        size_t overhead = base - hs->heaps[0].base;
 
-        overhead = oldHeapOverhead(hs, true);
+        assert(((size_t)hs->heaps[0].base & (SYSTEM_PAGE_SIZE - 1)) == 0);
         if (overhead + HEAP_MIN_FREE >= hs->absoluteMaxSize) {
             LOGE_HEAP("No room to create any more heaps "
                     "(%zd overhead, %zd max)\n",
                     overhead, hs->absoluteMaxSize);
             return false;
         }
+        hs->heaps[0].absoluteMaxSize = overhead;
+        hs->heaps[0].limit = base;
         heap.absoluteMaxSize = hs->absoluteMaxSize - overhead;
-        heap.msp = createMspace(HEAP_MIN_FREE, heap.absoluteMaxSize,
-                hs->numHeaps);
+        heap.msp = createMspace(base, HEAP_MIN_FREE, heap.absoluteMaxSize);
+        heap.concurrentStartBytes = HEAP_MIN_FREE - CONCURRENT_START;
+        heap.base = base;
+        heap.limit = heap.base + heap.absoluteMaxSize;
         if (heap.msp == NULL) {
             return false;
         }
-    }
-    if (!dvmHeapBitmapInit(&heap.objectBitmap,
-                           (void *)ALIGN_DOWN_TO_PAGE_SIZE(heap.msp),
-                           heap.absoluteMaxSize,
-                           "objects"))
-    {
-        LOGE_HEAP("Can't create objectBitmap\n");
-        goto fail;
     }
 
     /* Don't let the soon-to-be-old heap grow any further.
@@ -373,12 +432,47 @@ addNewHeap(HeapSource *hs, mspace msp, size_t mspAbsoluteMaxSize)
     hs->numHeaps++;
 
     return true;
+}
 
-fail:
-    if (msp == NULL) {
-        destroy_contiguous_mspace(heap.msp);
+/*
+ * The garbage collection daemon.  Initiates a concurrent collection
+ * when signaled.
+ */
+static void *gcDaemonThread(void* arg)
+{
+    dvmChangeStatus(NULL, THREAD_VMWAIT);
+    dvmLockMutex(&gHs->gcThreadMutex);
+    while (gHs->gcThreadShutdown != true) {
+        dvmWaitCond(&gHs->gcThreadCond, &gHs->gcThreadMutex);
+        dvmLockHeap();
+        dvmChangeStatus(NULL, THREAD_RUNNING);
+        dvmCollectGarbageInternal(false, GC_CONCURRENT);
+        dvmChangeStatus(NULL, THREAD_VMWAIT);
+        dvmUnlockHeap();
     }
-    return false;
+    dvmChangeStatus(NULL, THREAD_RUNNING);
+    return NULL;
+}
+
+static bool gcDaemonStartup(void)
+{
+    dvmInitMutex(&gHs->gcThreadMutex);
+    pthread_cond_init(&gHs->gcThreadCond, NULL);
+    gHs->gcThreadShutdown = false;
+    gHs->hasGcThread = dvmCreateInternalThread(&gHs->gcThread, "GC",
+                                               gcDaemonThread, NULL);
+    return gHs->hasGcThread;
+}
+
+static void gcDaemonShutdown(void)
+{
+    if (gHs->hasGcThread) {
+        dvmLockMutex(&gHs->gcThreadMutex);
+        gHs->gcThreadShutdown = true;
+        dvmSignalCond(&gHs->gcThreadCond);
+        dvmUnlockMutex(&gHs->gcThreadMutex);
+        pthread_join(gHs->gcThread, NULL);
+    }
 }
 
 /*
@@ -391,8 +485,9 @@ dvmHeapSourceStartup(size_t startSize, size_t absoluteMaxSize)
 {
     GcHeap *gcHeap;
     HeapSource *hs;
-    Heap *heap;
     mspace msp;
+    size_t length;
+    void *base;
 
     assert(gHs == NULL);
 
@@ -402,12 +497,22 @@ dvmHeapSourceStartup(size_t startSize, size_t absoluteMaxSize)
         return NULL;
     }
 
+    /*
+     * Allocate a contiguous region of virtual memory to subdivided
+     * among the heaps managed by the garbage collector.
+     */
+    length = ALIGN_UP_TO_PAGE_SIZE(absoluteMaxSize);
+    base = dvmAllocRegion(length, PROT_NONE, "dalvik-heap");
+    if (base == NULL) {
+        return NULL;
+    }
+
     /* Create an unlocked dlmalloc mspace to use as
      * the small object heap source.
      */
-    msp = createMspace(startSize, absoluteMaxSize, 0);
+    msp = createMspace(base, startSize, absoluteMaxSize);
     if (msp == NULL) {
-        return false;
+        goto fail;
     }
 
     /* Allocate a descriptor from the heap we just created.
@@ -431,14 +536,27 @@ dvmHeapSourceStartup(size_t startSize, size_t absoluteMaxSize)
     hs->startSize = startSize;
     hs->absoluteMaxSize = absoluteMaxSize;
     hs->idealSize = startSize;
-    hs->softLimit = INT_MAX;    // no soft limit at first
+    hs->softLimit = SIZE_MAX;    // no soft limit at first
     hs->numHeaps = 0;
     hs->sawZygote = gDvm.zygote;
+    hs->hasGcThread = false;
+    hs->heapBase = base;
+    hs->heapLength = length;
     if (!addNewHeap(hs, msp, absoluteMaxSize)) {
         LOGE_HEAP("Can't add initial heap\n");
         goto fail;
     }
+    if (!dvmHeapBitmapInit(&hs->liveBits, base, length, "dalvik-bitmap-1")) {
+        LOGE_HEAP("Can't create liveBits\n");
+        goto fail;
+    }
+    if (!dvmHeapBitmapInit(&hs->markBits, base, length, "dalvik-bitmap-2")) {
+        LOGE_HEAP("Can't create markBits\n");
+        dvmHeapBitmapDelete(&hs->liveBits);
+        goto fail;
+    }
 
+    gcHeap->markContext.bitmap = &hs->markBits;
     gcHeap->heapSource = hs;
 
     countAllocation(hs2heap(hs), gcHeap, false);
@@ -448,31 +566,13 @@ dvmHeapSourceStartup(size_t startSize, size_t absoluteMaxSize)
     return gcHeap;
 
 fail:
-    destroy_contiguous_mspace(msp);
+    munmap(base, length);
     return NULL;
 }
 
-/*
- * If the HeapSource was created while in zygote mode, this
- * will create a new heap for post-zygote allocations.
- * Having a separate heap should maximize the number of pages
- * that a given app_process shares with the zygote process.
- */
-bool
-dvmHeapSourceStartupAfterZygote()
+bool dvmHeapSourceStartupAfterZygote(void)
 {
-    HeapSource *hs = gHs; // use a local to avoid the implicit "volatile"
-
-    HS_BOILERPLATE();
-
-    assert(!gDvm.zygote);
-
-    if (hs->sawZygote) {
-        /* Create a new heap for post-zygote allocations.
-         */
-        return addNewHeap(hs, NULL, 0);
-    }
-    return true;
+    return gDvm.concurrentMarkSweep ? gcDaemonStartup() : true;
 }
 
 /*
@@ -502,35 +602,44 @@ dvmHeapSourceStartupBeforeFork()
     return true;
 }
 
+void dvmHeapSourceThreadShutdown(void)
+{
+    if (gDvm.gcHeap != NULL && gDvm.concurrentMarkSweep) {
+        gcDaemonShutdown();
+    }
+}
+
 /*
- * Tears down the heap source and frees any resources associated with it.
+ * Tears down the entire GcHeap structure and all of the substructures
+ * attached to it.  This call has the side effect of setting the given
+ * gcHeap pointer and gHs to NULL.
  */
 void
-dvmHeapSourceShutdown(GcHeap *gcHeap)
+dvmHeapSourceShutdown(GcHeap **gcHeap)
 {
-    if (gcHeap != NULL && gcHeap->heapSource != NULL) {
+    if (*gcHeap != NULL && (*gcHeap)->heapSource != NULL) {
         HeapSource *hs;
-        size_t numHeaps;
-        size_t i;
 
-        hs = gcHeap->heapSource;
+        hs = (*gcHeap)->heapSource;
+
+        assert((char *)*gcHeap >= hs->heapBase);
+        assert((char *)*gcHeap < hs->heapBase + hs->heapLength);
+
+        dvmHeapBitmapDelete(&hs->liveBits);
+        dvmHeapBitmapDelete(&hs->markBits);
+
+        munmap(hs->heapBase, hs->heapLength);
         gHs = NULL;
-
-        /* Cache numHeaps because hs will be invalid after the last
-         * heap is freed.
-         */
-        numHeaps = hs->numHeaps;
-
-        for (i = 0; i < numHeaps; i++) {
-            Heap *heap = &hs->heaps[i];
-
-            dvmHeapBitmapDelete(&heap->objectBitmap);
-            destroy_contiguous_mspace(heap->msp);
-        }
-        /* The last heap is the original one, which contains the
-         * HeapSource object itself.
-         */
+        *gcHeap = NULL;
     }
+}
+
+/*
+ * Gets the begining of the allocation for the HeapSource.
+ */
+void *dvmHeapSourceGetBase(void)
+{
+    return gHs->heapBase;
 }
 
 /*
@@ -589,59 +698,113 @@ dvmHeapSourceGetValue(enum HeapSourceValueSpec spec, size_t perHeapStats[],
     return total;
 }
 
-/*
- * Writes shallow copies of the currently-used bitmaps into outBitmaps,
- * returning the number of bitmaps written.  Returns 0 if the array was
- * not long enough or if there are no heaps, either of which is an error.
- */
-size_t
-dvmHeapSourceGetObjectBitmaps(HeapBitmap outBitmaps[], size_t maxBitmaps)
-{
-    HeapSource *hs = gHs;
+static void aliasBitmap(HeapBitmap *dst, HeapBitmap *src,
+                        uintptr_t base, uintptr_t max) {
+    size_t offset;
 
-    HS_BOILERPLATE();
-
-    assert(hs->numHeaps != 0);
-    if (maxBitmaps >= hs->numHeaps) {
-        size_t i;
-
-        for (i = 0; i < hs->numHeaps; i++) {
-            outBitmaps[i] = hs->heaps[i].objectBitmap;
-        }
-        return i;
-    }
-    return 0;
+    dst->base = base;
+    dst->max = max;
+    dst->bitsLen = HB_OFFSET_TO_BYTE_INDEX(max - base) + sizeof(dst->bits);
+    /* The exclusive limit from bitsLen is greater than the inclusive max. */
+    assert(base + HB_MAX_OFFSET(dst) > max);
+    /* The exclusive limit is at most one word of bits beyond max. */
+    assert((base + HB_MAX_OFFSET(dst)) - max <=
+           HB_OBJECT_ALIGNMENT * HB_BITS_PER_WORD);
+    dst->allocLen = dst->bitsLen;
+    offset = base - src->base;
+    assert(HB_OFFSET_TO_MASK(offset) == 1 << 31);
+    dst->bits = &src->bits[HB_OFFSET_TO_INDEX(offset)];
 }
 
 /*
- * Replaces the object location HeapBitmaps with the elements of
- * <objectBitmaps>.  The elements of <objectBitmaps> are overwritten
- * with shallow copies of the old bitmaps.
- *
- * Returns false if the number of bitmaps doesn't match the number
- * of heaps.
+ * Initializes a vector of object and mark bits to the object and mark
+ * bits of each heap.  The bits are aliased to the heapsource
+ * object and mark bitmaps.  This routine is used by the sweep code
+ * which needs to free each object in the correct heap.
  */
-bool
-dvmHeapSourceReplaceObjectBitmaps(HeapBitmap objectBitmaps[], size_t nBitmaps)
+void dvmHeapSourceGetObjectBitmaps(HeapBitmap liveBits[], HeapBitmap markBits[],
+                                   size_t numHeaps)
 {
     HeapSource *hs = gHs;
+    uintptr_t base, max;
     size_t i;
 
     HS_BOILERPLATE();
 
-    if (nBitmaps != hs->numHeaps) {
-        return false;
+    assert(numHeaps == hs->numHeaps);
+    for (i = 0; i < hs->numHeaps; ++i) {
+        base = (uintptr_t)hs->heaps[i].base;
+        /* -1 because limit is exclusive but max is inclusive. */
+        max = MIN((uintptr_t)hs->heaps[i].limit - 1, hs->markBits.max);
+        aliasBitmap(&liveBits[i], &hs->liveBits, base, max);
+        aliasBitmap(&markBits[i], &hs->markBits, base, max);
     }
+}
 
-    for (i = 0; i < hs->numHeaps; i++) {
-        Heap *heap = &hs->heaps[i];
-        HeapBitmap swap;
+/*
+ * Get the bitmap representing all live objects.
+ */
+HeapBitmap *dvmHeapSourceGetLiveBits(void)
+{
+    HS_BOILERPLATE();
 
-        swap = heap->objectBitmap;
-        heap->objectBitmap = objectBitmaps[i];
-        objectBitmaps[i] = swap;
+    return &gHs->liveBits;
+}
+
+void dvmHeapSourceSwapBitmaps(void)
+{
+    HeapBitmap tmp;
+
+    tmp = gHs->liveBits;
+    gHs->liveBits = gHs->markBits;
+    gHs->markBits = tmp;
+}
+
+void dvmHeapSourceZeroMarkBitmap(void)
+{
+    HS_BOILERPLATE();
+
+    dvmHeapBitmapZero(&gHs->markBits);
+}
+
+void dvmMarkImmuneObjects(const char *immuneLimit)
+{
+    char *dst, *src;
+    size_t i, index, length;
+
+    /*
+     * Copy the contents of the live bit vector for immune object
+     * range into the mark bit vector.
+     */
+    /* The only values generated by dvmHeapSourceGetImmuneLimit() */
+    assert(immuneLimit == gHs->heaps[0].base ||
+           immuneLimit == NULL);
+    assert(gHs->liveBits.base == gHs->markBits.base);
+    assert(gHs->liveBits.bitsLen == gHs->markBits.bitsLen);
+    /* heap[0] is never immune */
+    assert(gHs->heaps[0].base >= immuneLimit);
+    assert(gHs->heaps[0].limit > immuneLimit);
+
+    for (i = 1; i < gHs->numHeaps; ++i) {
+        if (gHs->heaps[i].base < immuneLimit) {
+            assert(gHs->heaps[i].limit <= immuneLimit);
+            /* Compute the number of words to copy in the bitmap. */
+            index = HB_OFFSET_TO_INDEX(
+                (uintptr_t)gHs->heaps[i].base - gHs->liveBits.base);
+            /* Compute the starting offset in the live and mark bits. */
+            src = (char *)(gHs->liveBits.bits + index);
+            dst = (char *)(gHs->markBits.bits + index);
+            /* Compute the number of bytes of the live bitmap to copy. */
+            length = HB_OFFSET_TO_BYTE_INDEX(
+                gHs->heaps[i].limit - gHs->heaps[i].base);
+            /* Do the copy. */
+            memcpy(dst, src, length);
+            /* Make sure max points to the address of the highest set bit. */
+            if (gHs->markBits.max < (uintptr_t)gHs->heaps[i].limit) {
+                gHs->markBits.max = (uintptr_t)gHs->heaps[i].limit;
+            }
+        }
     }
-    return true;
 }
 
 /*
@@ -656,22 +819,36 @@ dvmHeapSourceAlloc(size_t n)
 
     HS_BOILERPLATE();
     heap = hs2heap(hs);
-
-    if (heap->bytesAllocated + n <= hs->softLimit) {
-// TODO: allocate large blocks (>64k?) as separate mmap regions so that
-//       they don't increase the high-water mark when they're freed.
-// TODO: zero out large objects using madvise
-        ptr = mspace_calloc(heap->msp, 1, n);
-        if (ptr != NULL) {
-            countAllocation(heap, ptr, true);
-        }
-    } else {
-        /* This allocation would push us over the soft limit;
-         * act as if the heap is full.
+    if (heap->bytesAllocated + n > hs->softLimit) {
+        /*
+         * This allocation would push us over the soft limit; act as
+         * if the heap is full.
          */
         LOGV_HEAP("softLimit of %zd.%03zdMB hit for %zd-byte allocation\n",
-                FRACTIONAL_MB(hs->softLimit), n);
-        ptr = NULL;
+                  FRACTIONAL_MB(hs->softLimit), n);
+        return NULL;
+    }
+    ptr = mspace_calloc(heap->msp, 1, n);
+    if (ptr == NULL) {
+        return NULL;
+    }
+    countAllocation(heap, ptr, true);
+    /*
+     * Check to see if a concurrent GC should be initiated.
+     */
+    if (gDvm.gcHeap->gcRunning || !hs->hasGcThread) {
+        /*
+         * The garbage collector thread is already running or has yet
+         * to be started.  Do nothing.
+         */
+        return ptr;
+    }
+    if (heap->bytesAllocated > heap->concurrentStartBytes) {
+        /*
+         * We have exceeded the allocation threshold.  Wake up the
+         * garbage collector.
+         */
+        dvmSignalCond(&gHs->gcThreadCond);
     }
     return ptr;
 }
@@ -732,7 +909,7 @@ dvmHeapSourceAllocAndGrow(size_t n)
         /* We're soft-limited.  Try removing the soft limit to
          * see if we can allocate without actually growing.
          */
-        hs->softLimit = INT_MAX;
+        hs->softLimit = SIZE_MAX;
         ptr = dvmHeapSourceAlloc(n);
         if (ptr != NULL) {
             /* Removing the soft limit worked;  fix things up to
@@ -741,7 +918,7 @@ dvmHeapSourceAllocAndGrow(size_t n)
             snapIdealFootprint();
             return ptr;
         }
-        // softLimit intentionally left at INT_MAX.
+        // softLimit intentionally left at SIZE_MAX.
     }
 
     /* We're not soft-limited.  Grow the heap to satisfy the request.
@@ -763,47 +940,26 @@ dvmHeapSourceAllocAndGrow(size_t n)
 }
 
 /*
- * Frees the memory pointed to by <ptr>, which may be NULL.
+ * Frees the first numPtrs objects in the ptrs list and returns the
+ * amount of reclaimed storage. The list must contain addresses all in
+ * the same mspace, and must be in increasing order. This implies that
+ * there are no duplicates, and no entries are NULL.
  */
-void
-dvmHeapSourceFree(void *ptr)
+size_t dvmHeapSourceFreeList(size_t numPtrs, void **ptrs)
 {
     Heap *heap;
-
-    HS_BOILERPLATE();
-
-    heap = ptr2heap(gHs, ptr);
-    if (heap != NULL) {
-        countFree(heap, ptr, true);
-        /* Only free objects that are in the active heap.
-         * Touching old heaps would pull pages into this process.
-         */
-        if (heap == gHs->heaps) {
-            mspace_free(heap->msp, ptr);
-        }
-    }
-}
-
-/*
- * Frees the first numPtrs objects in the ptrs list. The list must
- * contain addresses all in the same mspace, and must be in increasing
- * order. This implies that there are no duplicates, and no entries
- * are NULL.
- */
-void
-dvmHeapSourceFreeList(size_t numPtrs, void **ptrs)
-{
-    Heap *heap;
+    size_t numBytes;
 
     HS_BOILERPLATE();
 
     if (numPtrs == 0) {
-        return;
+        return 0;
     }
 
     assert(ptrs != NULL);
     assert(*ptrs != NULL);
     heap = ptr2heap(gHs, *ptrs);
+    numBytes = 0;
     if (heap != NULL) {
         mspace *msp = heap->msp;
         // Calling mspace_free on shared heaps disrupts sharing too
@@ -827,7 +983,7 @@ dvmHeapSourceFreeList(size_t numPtrs, void **ptrs)
             // countFree ptrs[0] and initializing merged.
             assert(ptrs[0] != NULL);
             assert(ptr2heap(gHs, ptrs[0]) == heap);
-            countFree(heap, ptrs[0], true);
+            countFree(heap, ptrs[0], &numBytes);
             void *merged = ptrs[0];
 
             size_t i;
@@ -836,7 +992,7 @@ dvmHeapSourceFreeList(size_t numPtrs, void **ptrs)
                 assert(ptrs[i] != NULL);
                 assert((intptr_t)merged < (intptr_t)ptrs[i]);
                 assert(ptr2heap(gHs, ptrs[i]) == heap);
-                countFree(heap, ptrs[i], true);
+                countFree(heap, ptrs[i], &numBytes);
                 // Try to merge. If it works, merged now includes the
                 // memory of ptrs[i]. If it doesn't, free merged, and
                 // see if ptrs[i] starts a new run of adjacent
@@ -854,10 +1010,22 @@ dvmHeapSourceFreeList(size_t numPtrs, void **ptrs)
             for (i = 0; i < numPtrs; i++) {
                 assert(ptrs[i] != NULL);
                 assert(ptr2heap(gHs, ptrs[i]) == heap);
-                countFree(heap, ptrs[i], true);
+                countFree(heap, ptrs[i], &numBytes);
             }
         }
     }
+    return numBytes;
+}
+
+/*
+ * Returns true iff <ptr> is in the heap source.
+ */
+bool
+dvmHeapSourceContainsAddress(const void *ptr)
+{
+    HS_BOILERPLATE();
+
+    return (dvmHeapBitmapCoversAddress(&gHs->liveBits, ptr));
 }
 
 /*
@@ -866,13 +1034,10 @@ dvmHeapSourceFreeList(size_t numPtrs, void **ptrs)
 bool
 dvmHeapSourceContains(const void *ptr)
 {
-    Heap *heap;
-
     HS_BOILERPLATE();
 
-    heap = ptr2heap(gHs, ptr);
-    if (heap != NULL) {
-        return dvmHeapBitmapIsObjectBitSet(&heap->objectBitmap, ptr) != 0;
+    if (dvmHeapSourceContainsAddress(ptr)) {
+        return dvmHeapBitmapIsObjectBitSet(&gHs->liveBits, ptr) != 0;
     }
     return false;
 }
@@ -1006,7 +1171,7 @@ setSoftLimit(HeapSource *hs, size_t softLimit)
          * soft limit, if set.
          */
         mspace_set_max_allowed_footprint(msp, softLimit);
-        hs->softLimit = INT_MAX;
+        hs->softLimit = SIZE_MAX;
     }
 }
 
@@ -1067,8 +1232,6 @@ setIdealFootprint(size_t max)
 static void
 snapIdealFootprint()
 {
-    HeapSource *hs = gHs;
-
     HS_BOILERPLATE();
 
     setIdealFootprint(getSoftFootprint(true));
@@ -1094,7 +1257,6 @@ float dvmGetTargetHeapUtilization()
 void dvmSetTargetHeapUtilization(float newTarget)
 {
     HeapSource *hs = gHs;
-    size_t newUtilization;
 
     HS_BOILERPLATE();
 
@@ -1109,7 +1271,7 @@ void dvmSetTargetHeapUtilization(float newTarget)
 
     hs->targetUtilization =
             (size_t)(newTarget * (float)HEAP_UTILIZATION_MAX);
-    LOGV("Set heap target utilization to %zd/%d (%f)\n", 
+    LOGV("Set heap target utilization to %zd/%d (%f)\n",
             hs->targetUtilization, HEAP_UTILIZATION_MAX, newTarget);
 }
 
@@ -1168,8 +1330,7 @@ dvmMinimumHeapSize(size_t size, bool set)
  * targetUtilization is in the range 1..HEAP_UTILIZATION_MAX.
  */
 static size_t
-getUtilizationTarget(const HeapSource *hs,
-        size_t liveSize, size_t targetUtilization)
+getUtilizationTarget(size_t liveSize, size_t targetUtilization)
 {
     size_t targetSize;
 
@@ -1203,6 +1364,7 @@ void dvmHeapSourceGrowForUtilization()
     size_t oldIdealSize;
     size_t newHeapMax;
     size_t overhead;
+    size_t freeBytes;
 
     HS_BOILERPLATE();
     heap = hs2heap(hs);
@@ -1232,7 +1394,7 @@ void dvmHeapSourceGrowForUtilization()
     currentHeapUsed += hs->externalBytesAllocated;
 #endif
     targetHeapSize =
-            getUtilizationTarget(hs, currentHeapUsed, hs->targetUtilization);
+            getUtilizationTarget(currentHeapUsed, hs->targetUtilization);
 #if LET_EXTERNAL_INFLUENCE_UTILIZATION
     currentHeapUsed -= hs->externalBytesAllocated;
     targetHeapSize -= hs->externalBytesAllocated;
@@ -1247,6 +1409,13 @@ void dvmHeapSourceGrowForUtilization()
     oldIdealSize = hs->idealSize;
     setIdealFootprint(targetHeapSize + overhead);
 
+    freeBytes = getAllocLimit(hs);
+    if (freeBytes < CONCURRENT_MIN_FREE) {
+        /* Not enough free memory to allow a concurrent GC. */
+        heap->concurrentStartBytes = SIZE_MAX;
+    } else {
+        heap->concurrentStartBytes = freeBytes - CONCURRENT_START;
+    }
     newHeapMax = mspace_max_allowed_footprint(heap->msp);
     if (softLimited(hs)) {
         LOGD_HEAP("GC old usage %zd.%zd%%; now "
@@ -1317,7 +1486,7 @@ dvmHeapSourceTrim(size_t bytesTrimmed[], size_t arrayLen)
         /* Return any whole free pages to the system.
          */
         bytesTrimmed[i] = 0;
-        mspace_walk_free_pages(heap->msp, releasePagesInRange, 
+        mspace_walk_free_pages(heap->msp, releasePagesInRange,
                                &bytesTrimmed[i]);
         heapBytes += bytesTrimmed[i];
     }
@@ -1381,12 +1550,14 @@ dvmHeapSourceGetNumHeaps()
  * GCs.
  */
 
-
-static bool
-externalAllocPossible(const HeapSource *hs, size_t n)
+/*
+ * Returns true if the requested number of bytes can be allocated from
+ * available storage.
+ */
+static bool externalBytesAvailable(const HeapSource *hs, size_t numBytes)
 {
     const Heap *heap;
-    size_t currentHeapSize;
+    size_t currentHeapSize, newHeapSize;
 
     /* Make sure that this allocation is even possible.
      * Don't let the external size plus the actual heap size
@@ -1398,14 +1569,13 @@ externalAllocPossible(const HeapSource *hs, size_t n)
      */
     heap = hs2heap(hs);
     currentHeapSize = mspace_max_allowed_footprint(heap->msp);
-    if (currentHeapSize + hs->externalBytesAllocated + n <=
-            heap->absoluteMaxSize)
-    {
+    newHeapSize = currentHeapSize + hs->externalBytesAllocated + numBytes;
+    if (newHeapSize <= heap->absoluteMaxSize) {
         return true;
     }
-    HSTRACE("externalAllocPossible(): "
+    HSTRACE("externalBytesAvailable(): "
             "footprint %zu + extAlloc %zu + n %zu >= max %zu (space for %zu)\n",
-            currentHeapSize, hs->externalBytesAllocated, n,
+            currentHeapSize, hs->externalBytesAllocated, numBytes,
             heap->absoluteMaxSize,
             heap->absoluteMaxSize -
                     (currentHeapSize + hs->externalBytesAllocated));
@@ -1418,29 +1588,23 @@ externalAllocPossible(const HeapSource *hs, size_t n)
  * Tries to update the internal count of externally-allocated memory.
  * If there's enough room for that memory, returns true.  If not, returns
  * false and does not update the count.
- * 
- * The caller must ensure externalAllocPossible(hs, n) == true.
+ *
+ * The caller must ensure externalBytesAvailable(hs, n) == true.
  */
 static bool
 externalAlloc(HeapSource *hs, size_t n, bool grow)
 {
-    Heap *heap;
-    size_t currentHeapSize;
-    size_t newTotal;
-    size_t max;
-    bool grew;
-
     assert(hs->externalLimit >= hs->externalBytesAllocated);
 
     HSTRACE("externalAlloc(%zd%s)\n", n, grow ? ", grow" : "");
-    assert(externalAllocPossible(hs, n));  // The caller must ensure this.
+    assert(externalBytesAvailable(hs, n));  // The caller must ensure this.
 
     /* External allocations have their own "free space" that they
      * can allocate from without causing a GC.
      */
     if (hs->externalBytesAllocated + n <= hs->externalLimit) {
         hs->externalBytesAllocated += n;
-#if defined(WITH_PROFILER) && PROFILE_EXTERNAL_ALLOCATIONS
+#if PROFILE_EXTERNAL_ALLOCATIONS
         if (gDvm.allocProf.enabled) {
             Thread* self = dvmThreadSelf();
             gDvm.allocProf.externalAllocCount++;
@@ -1459,7 +1623,7 @@ externalAlloc(HeapSource *hs, size_t n, bool grow)
 
     /* GROW */
     hs->externalBytesAllocated += n;
-    hs->externalLimit = getUtilizationTarget(hs,
+    hs->externalLimit = getUtilizationTarget(
             hs->externalBytesAllocated, EXTERNAL_TARGET_UTILIZATION);
     HSTRACE("EXTERNAL grow limit to %zd\n", hs->externalLimit);
     return true;
@@ -1468,7 +1632,6 @@ externalAlloc(HeapSource *hs, size_t n, bool grow)
 static void
 gcForExternalAlloc(bool collectSoftReferences)
 {
-#ifdef WITH_PROFILER  // even if !PROFILE_EXTERNAL_ALLOCATIONS
     if (gDvm.allocProf.enabled) {
         Thread* self = dvmThreadSelf();
         gDvm.allocProf.gcCount++;
@@ -1476,8 +1639,59 @@ gcForExternalAlloc(bool collectSoftReferences)
             self->allocProf.gcCount++;
         }
     }
-#endif
     dvmCollectGarbageInternal(collectSoftReferences, GC_EXTERNAL_ALLOC);
+}
+
+/*
+ * Returns true if there is enough unused storage to perform an
+ * external allocation of the specified size.  If there insufficient
+ * free storage we try to releasing memory from external allocations
+ * and trimming the heap.
+ */
+static bool externalAllocPossible(const HeapSource *hs, size_t n)
+{
+    size_t bytesTrimmed[HEAP_SOURCE_MAX_HEAP_COUNT];
+
+    /*
+     * If there is sufficient space return immediately.
+     */
+    if (externalBytesAvailable(hs, n)) {
+        return true;
+    }
+    /*
+     * There is insufficient space.  Wait for the garbage collector to
+     * become inactive before proceeding.
+     */
+    while (gDvm.gcHeap->gcRunning) {
+        dvmWaitForConcurrentGcToComplete();
+    }
+    /*
+     * The heap may have grown or become trimmed while we were
+     * waiting.
+     */
+    if (externalBytesAvailable(hs, n)) {
+        return true;
+    }
+    /*
+     * Try a garbage collection that clears soft references.  This may
+     * make trimming more effective.
+     */
+    gcForExternalAlloc(true);
+    if (externalBytesAvailable(hs, n)) {
+        return true;
+    }
+    /*
+     * Try trimming the mspace to reclaim unused pages.
+     */
+    dvmHeapSourceTrim(bytesTrimmed, NELEM(bytesTrimmed));
+    snapIdealFootprint();
+    if (externalBytesAvailable(hs, n)) {
+        return true;
+    }
+    /*
+     * Nothing worked, return an error.
+     */
+    return false;
 }
 
 /*
@@ -1491,7 +1705,6 @@ bool
 dvmTrackExternalAllocation(size_t n)
 {
     HeapSource *hs = gHs;
-    size_t overhead;
     bool ret = false;
 
     /* gHs caches an entry in gDvm.gcHeap;  we need to hold the
@@ -1502,9 +1715,13 @@ dvmTrackExternalAllocation(size_t n)
     HS_BOILERPLATE();
     assert(hs->externalLimit >= hs->externalBytesAllocated);
 
+    /*
+     * The externalAlloc calls require the externalAllocPossible
+     * invariant to be established.
+     */
     if (!externalAllocPossible(hs, n)) {
         LOGE_HEAP("%zd-byte external allocation "
-                "too large for this process.\n", n);
+                  "too large for this process.", n);
         goto out;
     }
 
@@ -1516,7 +1733,21 @@ dvmTrackExternalAllocation(size_t n)
         ret = true;
         goto out;
     }
-
+    /*
+     * Wait until garbage collector is quiescent before proceeding.
+     */
+    while (gDvm.gcHeap->gcRunning) {
+        dvmWaitForConcurrentGcToComplete();
+    }
+    /*
+     * Re-establish the invariant if it was lost while we were
+     * waiting.
+     */
+    if (!externalAllocPossible(hs, n)) {
+        LOGE_HEAP("%zd-byte external allocation "
+                  "too large for this process.", n);
+        goto out;
+    }
     /* The "allocation" failed.  Free up some space by doing
      * a full garbage collection.  This may grow the heap source
      * if the live set is sufficiently large.
@@ -1533,7 +1764,6 @@ dvmTrackExternalAllocation(size_t n)
      */
     HSTRACE("EXTERNAL alloc %zd: frag\n", n);
     ret = externalAlloc(hs, n, true);
-    dvmHeapSizeChanged();
     if (ret) {
         goto out;
     }
@@ -1544,12 +1774,11 @@ dvmTrackExternalAllocation(size_t n)
     HSTRACE("EXTERNAL alloc %zd: GC 2\n", n);
     gcForExternalAlloc(true);  // collect SoftReferences
     ret = externalAlloc(hs, n, true);
-    dvmHeapSizeChanged();
     if (!ret) {
         LOGE_HEAP("Out of external memory on a %zu-byte allocation.\n", n);
     }
 
-#if defined(WITH_PROFILER) && PROFILE_EXTERNAL_ALLOCATIONS
+#if PROFILE_EXTERNAL_ALLOCATIONS
     if (gDvm.allocProf.enabled) {
         Thread* self = dvmThreadSelf();
         gDvm.allocProf.failedExternalAllocCount++;
@@ -1574,7 +1803,6 @@ void
 dvmTrackExternalFree(size_t n)
 {
     HeapSource *hs = gHs;
-    size_t newIdealSize;
     size_t newExternalLimit;
     size_t oldExternalBytesAllocated;
 
@@ -1597,7 +1825,7 @@ dvmTrackExternalFree(size_t n)
         hs->externalBytesAllocated = 0;
     }
 
-#if defined(WITH_PROFILER) && PROFILE_EXTERNAL_ALLOCATIONS
+#if PROFILE_EXTERNAL_ALLOCATIONS
     if (gDvm.allocProf.enabled) {
         Thread* self = dvmThreadSelf();
         gDvm.allocProf.externalFreeCount++;
@@ -1611,7 +1839,7 @@ dvmTrackExternalFree(size_t n)
 
     /* Shrink as quickly as we can.
      */
-    newExternalLimit = getUtilizationTarget(hs,
+    newExternalLimit = getUtilizationTarget(
             hs->externalBytesAllocated, EXTERNAL_TARGET_UTILIZATION);
     if (newExternalLimit < oldExternalBytesAllocated) {
         /* Make sure that the remaining free space is at least
@@ -1651,4 +1879,13 @@ dvmGetExternalBytesAllocated()
     dvmUnlockHeap();
 
     return ret;
+}
+
+void *dvmHeapSourceGetImmuneLimit(GcMode mode)
+{
+    if (mode == GC_PARTIAL) {
+        return hs2heap(gHs)->base;
+    } else {
+        return NULL;
+    }
 }

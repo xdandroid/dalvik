@@ -34,10 +34,9 @@
 #include "libdex/DexClass.h"
 #include "libdex/DexProto.h"
 #include "libdex/InstrUtils.h"
+#include "libdex/OpCodeNames.h"
 #include "libdex/SysUtil.h"
 #include "libdex/CmdUtils.h"
-
-#include "dexdump/OpCodeNames.h"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -80,20 +79,20 @@ typedef struct FieldMethodInfo {
 } FieldMethodInfo;
 
 /*
- * Get 2 little-endian bytes. 
- */ 
+ * Get 2 little-endian bytes.
+ */
 static inline u2 get2LE(unsigned char const* pSrc)
 {
     return pSrc[0] | (pSrc[1] << 8);
-}   
+}
 
 /*
- * Get 4 little-endian bytes. 
- */ 
+ * Get 4 little-endian bytes.
+ */
 static inline u4 get4LE(unsigned char const* pSrc)
 {
     return pSrc[0] | (pSrc[1] << 8) | (pSrc[2] << 16) | (pSrc[3] << 24);
-}   
+}
 
 /*
  * Converts a single-character primitive type into its human-readable
@@ -225,20 +224,14 @@ static const char* quotedVisibility(u4 accessFlags)
 
 /*
  * Count the number of '1' bits in a word.
- *
- * Having completed this, I'm ready for an interview at Google.
- *
- * TODO? there's a parallel version w/o loops.  Performance not currently
- * important.
  */
 static int countOnes(u4 val)
 {
     int count = 0;
 
-    while (val != 0) {
-        val &= val-1;
-        count++;
-    }
+    val = val - ((val >> 1) & 0x55555555);
+    val = (val & 0x33333333) + ((val >> 2) & 0x33333333);
+    count = (((val + (val >> 4)) & 0x0F0F0F0F) * 0x01010101) >> 24;
 
     return count;
 }
@@ -261,7 +254,7 @@ static char* createAccessFlagStr(u4 flags, AccessFor forWhat)
 {
 #define NUM_FLAGS   18
     static const char* kAccessStrings[kAccessForMAX][NUM_FLAGS] = {
-        {   
+        {
             /* class, inner class */
             "PUBLIC",           /* 0x0001 */
             "PRIVATE",          /* 0x0002 */
@@ -357,14 +350,73 @@ static char* createAccessFlagStr(u4 flags, AccessFor forWhat)
 
 
 /*
+ * Copy character data from "data" to "out", converting non-ASCII values
+ * to printf format chars or an ASCII filler ('.' or '?').
+ *
+ * The output buffer must be able to hold (2*len)+1 bytes.  The result is
+ * NUL-terminated.
+ */
+static void asciify(char* out, const unsigned char* data, size_t len)
+{
+    while (len--) {
+        if (*data < 0x20) {
+            /* could do more here, but we don't need them yet */
+            switch (*data) {
+            case '\0':
+                *out++ = '\\';
+                *out++ = '0';
+                break;
+            case '\n':
+                *out++ = '\\';
+                *out++ = 'n';
+                break;
+            default:
+                *out++ = '.';
+                break;
+            }
+        } else if (*data >= 0x80) {
+            *out++ = '?';
+        } else {
+            *out++ = *data;
+        }
+        data++;
+    }
+    *out = '\0';
+}
+
+/*
  * Dump the file header.
  */
 void dumpFileHeader(const DexFile* pDexFile)
 {
+    const DexOptHeader* pOptHeader = pDexFile->pOptHeader;
     const DexHeader* pHeader = pDexFile->pHeader;
+    char sanitized[sizeof(pHeader->magic)*2 +1];
+
+    assert(sizeof(pHeader->magic) == sizeof(pOptHeader->magic));
+
+    if (pOptHeader != NULL) {
+        printf("Optimized DEX file header:\n");
+
+        asciify(sanitized, pOptHeader->magic, sizeof(pOptHeader->magic));
+        printf("magic               : '%s'\n", sanitized);
+        printf("dex_offset          : %d (0x%06x)\n",
+            pOptHeader->dexOffset, pOptHeader->dexOffset);
+        printf("dex_length          : %d\n", pOptHeader->dexLength);
+        printf("deps_offset         : %d (0x%06x)\n",
+            pOptHeader->depsOffset, pOptHeader->depsOffset);
+        printf("deps_length         : %d\n", pOptHeader->depsLength);
+        printf("opt_offset          : %d (0x%06x)\n",
+            pOptHeader->optOffset, pOptHeader->optOffset);
+        printf("opt_length          : %d\n", pOptHeader->optLength);
+        printf("flags               : %08x\n", pOptHeader->flags);
+        printf("checksum            : %08x\n", pOptHeader->checksum);
+        printf("\n");
+    }
 
     printf("DEX file header:\n");
-    printf("magic               : '%.8s'\n", pHeader->magic);
+    asciify(sanitized, pHeader->magic, sizeof(pHeader->magic));
+    printf("magic               : '%s'\n", sanitized);
     printf("checksum            : %08x\n", pHeader->checksum);
     printf("signature           : %02x%02x...%02x%02x\n",
         pHeader->signature[0], pHeader->signature[1],
@@ -393,6 +445,55 @@ void dumpFileHeader(const DexFile* pDexFile)
     printf("data_size           : %d\n", pHeader->dataSize);
     printf("data_off            : %d (0x%06x)\n",
         pHeader->dataOff, pHeader->dataOff);
+    printf("\n");
+}
+
+/*
+ * Dump the "table of contents" for the opt area.
+ */
+void dumpOptDirectory(const DexFile* pDexFile)
+{
+    const DexOptHeader* pOptHeader = pDexFile->pOptHeader;
+    if (pOptHeader == NULL)
+        return;
+
+    printf("OPT section contents:\n");
+
+    const u4* pOpt = (const u4*) ((u1*) pOptHeader + pOptHeader->optOffset);
+
+    if (*pOpt == 0) {
+        printf("(1.0 format, only class lookup table is present)\n\n");
+        return;
+    }
+
+    /*
+     * The "opt" section is in "chunk" format: a 32-bit identifier, a 32-bit
+     * length, then the data.  Chunks start on 64-bit boundaries.
+     */
+    while (*pOpt != kDexChunkEnd) {
+        const char* verboseStr;
+
+        u4 size = *(pOpt+1);
+
+        switch (*pOpt) {
+        case kDexChunkClassLookup:
+            verboseStr = "class lookup hash table";
+            break;
+        case kDexChunkRegisterMaps:
+            verboseStr = "register maps";
+            break;
+        default:
+            verboseStr = "(unknown chunk type)";
+            break;
+        }
+
+        printf("Chunk %08x (%c%c%c%c) - %s (%d bytes)\n", *pOpt,
+            *pOpt >> 24, (char)(*pOpt >> 16), (char)(*pOpt >> 8), (char)*pOpt,
+            verboseStr, size);
+
+        size = (size + 8 + 7) & ~7;
+        pOpt += size / sizeof(u4);
+    }
     printf("\n");
 }
 
@@ -465,7 +566,7 @@ void dumpCatches(DexFile* pDexFile, const DexCode* pCode)
     if (triesSize == 0) {
         printf("      catches       : (none)\n");
         return;
-    } 
+    }
 
     printf("      catches       : %d\n", triesSize);
 
@@ -477,7 +578,7 @@ void dumpCatches(DexFile* pDexFile, const DexCode* pCode)
         u4 start = pTry->startAddr;
         u4 end = start + pTry->insnCount;
         DexCatchIterator iterator;
-        
+
         printf("        0x%04x - 0x%04x\n", start, end);
 
         dexCatchIteratorInit(&iterator, pCode, pTry->handlerOff);
@@ -485,14 +586,14 @@ void dumpCatches(DexFile* pDexFile, const DexCode* pCode)
         for (;;) {
             DexCatchHandler* handler = dexCatchIteratorNext(&iterator);
             const char* descriptor;
-            
+
             if (handler == NULL) {
                 break;
             }
-            
-            descriptor = (handler->typeIdx == kDexNoIndex) ? "<any>" : 
+
+            descriptor = (handler->typeIdx == kDexNoIndex) ? "<any>" :
                 dexStringByTypeIdx(pDexFile, handler->typeIdx);
-            
+
             printf("          %s -> 0x%04x\n", descriptor,
                     handler->address);
         }
@@ -508,11 +609,11 @@ static int dumpPositionsCb(void *cnxt, u4 address, u4 lineNum)
 /*
  * Dump the positions list.
  */
-void dumpPositions(DexFile* pDexFile, const DexCode* pCode, 
+void dumpPositions(DexFile* pDexFile, const DexCode* pCode,
         const DexMethod *pDexMethod)
 {
     printf("      positions     : \n");
-    const DexMethodId *pMethodId 
+    const DexMethodId *pMethodId
             = dexGetMethodId(pDexFile, pDexMethod->methodIdx);
     const char *classDescriptor
             = dexStringByTypeIdx(pDexFile, pMethodId->classIdx);
@@ -526,7 +627,7 @@ static void dumpLocalsCb(void *cnxt, u2 reg, u4 startAddress,
         const char *signature)
 {
     printf("        0x%04x - 0x%04x reg=%d %s %s %s\n",
-            startAddress, endAddress, reg, name, descriptor, 
+            startAddress, endAddress, reg, name, descriptor,
             signature);
 }
 
@@ -538,9 +639,9 @@ void dumpLocals(DexFile* pDexFile, const DexCode* pCode,
 {
     printf("      locals        : \n");
 
-    const DexMethodId *pMethodId 
+    const DexMethodId *pMethodId
             = dexGetMethodId(pDexFile, pDexMethod->methodIdx);
-    const char *classDescriptor 
+    const char *classDescriptor
             = dexStringByTypeIdx(pDexFile, pMethodId->classIdx);
 
     dexDecodeDebugInfo(pDexFile, pCode, classDescriptor, pMethodId->protoIdx,
@@ -561,7 +662,7 @@ bool getMethodInfo(DexFile* pDexFile, u4 methodIdx, FieldMethodInfo* pMethInfo)
     pMethInfo->name = dexStringById(pDexFile, pMethodId->nameIdx);
     pMethInfo->signature = dexCopyDescriptorFromMethodId(pDexFile, pMethodId);
 
-    pMethInfo->classDescriptor = 
+    pMethInfo->classDescriptor =
             dexStringByTypeIdx(pDexFile, pMethodId->classIdx);
     return true;
 }
@@ -632,7 +733,7 @@ void dumpInstruction(DexFile* pDexFile, const DexCode* pCode, int insnIdx,
             printf("|%04x: nop // spacer", insnIdx);
         }
     } else {
-        printf("|%04x: %s", insnIdx, getOpcodeName(pDecInsn->opCode));
+        printf("|%04x: %s", insnIdx, dexGetOpcodeName(pDecInsn->opCode));
     }
 
     switch (dexGetInstrFormat(gInstrFormat, pDecInsn->opCode)) {
@@ -728,7 +829,14 @@ void dumpInstruction(DexFile* pDexFile, const DexCode* pCode, int insnIdx,
             pDecInsn->vA, pDecInsn->vB, (s4)pDecInsn->vC, (u2)pDecInsn->vC);
         break;
     case kFmt22c:        // op vA, vB, thing@CCCC
-        if (pDecInsn->opCode >= OP_IGET && pDecInsn->opCode <= OP_IPUT_SHORT) {
+        if (pDecInsn->opCode == OP_INSTANCE_OF ||
+            pDecInsn->opCode == OP_NEW_ARRAY)
+        {
+            printf(" v%d, v%d, %s // class@%04x",
+                pDecInsn->vA, pDecInsn->vB,
+                getClassDescriptor(pDexFile, pDecInsn->vC), pDecInsn->vC);
+        } else {
+            /* iget* and iput*, including dexopt-generated -volatile */
             FieldMethodInfo fieldInfo;
             if (getFieldInfo(pDexFile, pDecInsn->vC, &fieldInfo)) {
                 printf(" v%d, v%d, %s.%s:%s // field@%04x", pDecInsn->vA,
@@ -738,10 +846,6 @@ void dumpInstruction(DexFile* pDexFile, const DexCode* pCode, int insnIdx,
                 printf(" v%d, v%d, ??? // field@%04x", pDecInsn->vA,
                     pDecInsn->vB, pDecInsn->vC);
             }
-        } else {
-            printf(" v%d, v%d, %s // class@%04x",
-                pDecInsn->vA, pDecInsn->vB,
-                getClassDescriptor(pDexFile, pDecInsn->vC), pDecInsn->vC);
         }
         break;
     case kFmt22cs:       // [opt] op vA, vB, field offset CCCC
@@ -959,9 +1063,9 @@ void dumpBytecodes(DexFile* pDexFile, const DexMethod* pDexMethod)
             insnWidth = 2 + get2LE((const u1*)(insns+1)) * 4;
         } else if (instr == kArrayDataSignature) {
             int width = get2LE((const u1*)(insns+1));
-            int size = get2LE((const u1*)(insns+2)) | 
+            int size = get2LE((const u1*)(insns+2)) |
                        (get2LE((const u1*)(insns+3))<<16);
-            // The plus 1 is to round up for odd size and width 
+            // The plus 1 is to round up for odd size and width
             insnWidth = 4 + ((size * width) + 1) / 2;
         } else {
             opCode = instr & 0xff;
@@ -1247,7 +1351,7 @@ void dumpClass(DexFile* pDexFile, int idx, char** pLastPackage)
         printf("Trouble reading class data (#%d)\n", idx);
         goto bail;
     }
-    
+
     classDescriptor = dexStringByTypeIdx(pDexFile, pClassDef->classIdx);
 
     /*
@@ -1609,8 +1713,10 @@ void processDexFile(const char* fileName, DexFile* pDexFile)
         return;
     }
 
-    if (gOptions.showFileHeaders)
+    if (gOptions.showFileHeaders) {
         dumpFileHeader(pDexFile);
+        dumpOptDirectory(pDexFile);
+    }
 
     if (gOptions.outputFormat == OUTPUT_XML)
         printf("<api>\n");
@@ -1783,4 +1889,3 @@ int main(int argc, char* const argv[])
 
     return (result != 0);
 }
-

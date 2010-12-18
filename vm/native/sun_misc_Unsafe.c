@@ -52,22 +52,7 @@ static void Dalvik_sun_misc_Unsafe_arrayIndexScale0(const u4* args,
     JValue* pResult)
 {
     ClassObject* clazz = (ClassObject*) args[0];
-    int result;
-
-    if ((clazz == gDvm.classArrayBoolean) ||
-            (clazz == gDvm.classArrayByte)) {
-        result = sizeof(u1);
-    } else if ((clazz == gDvm.classArrayChar) ||
-            (clazz == gDvm.classArrayShort)) {
-        result = sizeof(u2);
-    } else if ((clazz == gDvm.classArrayLong) ||
-            (clazz == gDvm.classArrayDouble)) {
-        result = sizeof(u8);
-    } else {
-        result = sizeof(u4);
-    }
-
-    RETURN_INT(result);
+    RETURN_INT(dvmArrayClassElementWidth(clazz));
 }
 
 /*
@@ -84,8 +69,8 @@ static void Dalvik_sun_misc_Unsafe_compareAndSwapInt(const u4* args,
     s4 newValue = args[5];
     volatile int32_t* address = (volatile int32_t*) (((u1*) obj) + offset);
 
-    // Note: android_atomic_cmpxchg() returns 0 on success, not failure.
-    int result = android_atomic_cmpxchg(expectedValue, newValue, address);
+    // Note: android_atomic_release_cas() returns 0 on success, not failure.
+    int result = android_atomic_release_cas(expectedValue, newValue, address);
 
     RETURN_BOOLEAN(result == 0);
 }
@@ -106,7 +91,7 @@ static void Dalvik_sun_misc_Unsafe_compareAndSwapLong(const u4* args,
 
     // Note: android_atomic_cmpxchg() returns 0 on success, not failure.
     int result =
-        android_quasiatomic_cmpxchg_64(expectedValue, newValue, address);
+        dvmQuasiAtomicCas64(expectedValue, newValue, address);
 
     RETURN_BOOLEAN(result == 0);
 }
@@ -126,9 +111,9 @@ static void Dalvik_sun_misc_Unsafe_compareAndSwapObject(const u4* args,
     int32_t* address = (int32_t*) (((u1*) obj) + offset);
 
     // Note: android_atomic_cmpxchg() returns 0 on success, not failure.
-    int result = android_atomic_cmpxchg((int32_t) expectedValue,
+    int result = android_atomic_release_cas((int32_t) expectedValue,
             (int32_t) newValue, address);
-    
+    dvmWriteBarrierField(obj, address);
     RETURN_BOOLEAN(result == 0);
 }
 
@@ -141,9 +126,10 @@ static void Dalvik_sun_misc_Unsafe_getIntVolatile(const u4* args,
     // We ignore the this pointer in args[0].
     Object* obj = (Object*) args[1];
     s8 offset = GET_ARG_LONG(args, 2);
-    volatile s4* address = (volatile s4*) (((u1*) obj) + offset);
+    volatile int32_t* address = (volatile int32_t*) (((u1*) obj) + offset);
 
-    RETURN_INT(*address);
+    int32_t value = android_atomic_acquire_load(address);
+    RETURN_INT(value);
 }
 
 /*
@@ -156,9 +142,9 @@ static void Dalvik_sun_misc_Unsafe_putIntVolatile(const u4* args,
     Object* obj = (Object*) args[1];
     s8 offset = GET_ARG_LONG(args, 2);
     s4 value = (s4) args[4];
-    volatile s4* address = (volatile s4*) (((u1*) obj) + offset);
+    volatile int32_t* address = (volatile int32_t*) (((u1*) obj) + offset);
 
-    *address = value;
+    android_atomic_release_store(value, address);
     RETURN_VOID();
 }
 
@@ -171,9 +157,10 @@ static void Dalvik_sun_misc_Unsafe_getLongVolatile(const u4* args,
     // We ignore the this pointer in args[0].
     Object* obj = (Object*) args[1];
     s8 offset = GET_ARG_LONG(args, 2);
-    volatile s8* address = (volatile s8*) (((u1*) obj) + offset);
+    volatile int64_t* address = (volatile int64_t*) (((u1*) obj) + offset);
 
-    RETURN_LONG(android_quasiatomic_read_64(address));
+    assert((offset & 7) == 0);
+    RETURN_LONG(dvmQuasiAtomicRead64(address));
 }
 
 /*
@@ -186,9 +173,10 @@ static void Dalvik_sun_misc_Unsafe_putLongVolatile(const u4* args,
     Object* obj = (Object*) args[1];
     s8 offset = GET_ARG_LONG(args, 2);
     s8 value = GET_ARG_LONG(args, 4);
-    volatile s8* address = (volatile s8*) (((u1*) obj) + offset);
+    volatile int64_t* address = (volatile int64_t*) (((u1*) obj) + offset);
 
-    android_quasiatomic_swap_64(value, address);
+    assert((offset & 7) == 0);
+    dvmQuasiAtomicSwap64(value, address);
     RETURN_VOID();
 }
 
@@ -201,9 +189,9 @@ static void Dalvik_sun_misc_Unsafe_getObjectVolatile(const u4* args,
     // We ignore the this pointer in args[0].
     Object* obj = (Object*) args[1];
     s8 offset = GET_ARG_LONG(args, 2);
-    volatile Object** address = (volatile Object**) (((u1*) obj) + offset);
+    volatile int32_t* address = (volatile int32_t*) (((u1*) obj) + offset);
 
-    RETURN_PTR((void*) *address);
+    RETURN_PTR((Object*) android_atomic_acquire_load(address));
 }
 
 /*
@@ -217,12 +205,13 @@ static void Dalvik_sun_misc_Unsafe_putObjectVolatile(const u4* args,
     Object* obj = (Object*) args[1];
     s8 offset = GET_ARG_LONG(args, 2);
     Object* value = (Object*) args[4];
-    volatile Object** address = (volatile Object**) (((u1*) obj) + offset);
+    volatile int32_t* address = (volatile int32_t*) (((u1*) obj) + offset);
 
-    *address = value;
+    android_atomic_release_store((int32_t)value, address);
+    dvmWriteBarrierField(obj, (void *)address);
     RETURN_VOID();
 }
-            
+
 /*
  * public native int getInt(Object obj, long offset);
  */
@@ -304,6 +293,7 @@ static void Dalvik_sun_misc_Unsafe_putObject(const u4* args, JValue* pResult)
     Object** address = (Object**) (((u1*) obj) + offset);
 
     *address = value;
+    dvmWriteBarrierField(obj, address);
     RETURN_VOID();
 }
 
@@ -347,4 +337,3 @@ const DalvikNativeMethod dvm_sun_misc_Unsafe[] = {
       Dalvik_sun_misc_Unsafe_putObject },
     { NULL, NULL, NULL },
 };
-

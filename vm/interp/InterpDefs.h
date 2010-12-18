@@ -91,8 +91,8 @@ struct JitToInterpEntries {
 
 /* Number of entries in the 2nd level JIT profiler filter cache */
 #define JIT_TRACE_THRESH_FILTER_SIZE 32
-/* Granularity of coverage (power of 2) by each cached entry */
-#define JIT_TRACE_THRESH_FILTER_GRAN_LOG2 6
+/* Number of low dalvik pc address bits to include in 2nd level filter key */
+#define JIT_TRACE_THRESH_FILTER_PC_BITS 4
 #endif
 
 /*
@@ -124,14 +124,16 @@ typedef struct InterpState {
      * These are available globally, from gDvm, or from another glue field
      * (self/method).  They're copied in here for speed.
      */
+    /* copy of self->interpStackEnd */
     const u1*       interpStackEnd;
+    /* points at self->suspendCount */
     volatile int*   pSelfSuspendCount;
-#if defined(WITH_DEBUGGER)
+    /* Biased base of GC's card table */
+    u1*             cardTable;
+    /* points at gDvm.debuggerActive, or NULL if debugger not enabled */
     volatile u1*    pDebuggerActive;
-#endif
-#if defined(WITH_PROFILER)
+    /* points at gDvm.activeProfilers */
     volatile int*   pActiveProfilers;
-#endif
     /* ----------------------------------------------------------------------
      */
 
@@ -147,8 +149,8 @@ typedef struct InterpState {
      */
     unsigned char*     pJitProfTable;
     JitState           jitState;
-    const void*        jitResumeNPC;	// Native PC of compiled code
-    const u2*          jitResumeDPC;	// Dalvik PC corresponding to NPC
+    const void*        jitResumeNPC;    // Native PC of compiled code
+    const u2*          jitResumeDPC;    // Dalvik PC corresponding to NPC
     int                jitThreshold;
     /*
      * ppJitProfTable holds the address of gDvmJit.pJitProfTable, which
@@ -158,11 +160,10 @@ typedef struct InterpState {
      * ppJitProfTable is used for that purpose.
      */
     unsigned char**    ppJitProfTable; // Used to refresh pJitProfTable
+    int                icRechainCount; // Count down to next rechain request
 #endif
 
-#if defined(WITH_PROFILER) || defined(WITH_DEBUGGER)
     bool        debugIsMethodEntry;     // used for method entry event triggers
-#endif
 #if defined(WITH_TRACKREF_CHECKS)
     int         debugTrackedRefStart;   // tracked refs from prior invocations
 #endif
@@ -232,11 +233,7 @@ Method* dvmInterpFindInterfaceMethod(ClassObject* thisClass, u4 methodIdx,
  */
 static inline bool dvmDebuggerOrProfilerActive(void)
 {
-    return gDvm.debuggerActive
-#if defined(WITH_PROFILER)
-        || gDvm.activeProfilers != 0
-#endif
-        ;
+    return gDvm.debuggerActive || gDvm.activeProfilers != 0;
 }
 
 #if defined(WITH_JIT)
@@ -247,10 +244,33 @@ static inline bool dvmDebuggerOrProfilerActive(void)
 static inline bool dvmJitDebuggerOrProfilerActive()
 {
     return gDvmJit.pProfTable != NULL
-#if defined(WITH_PROFILER)
         || gDvm.activeProfilers != 0
-#endif
-        ||gDvm.debuggerActive;
+        || gDvm.debuggerActive;
+}
+
+/*
+ * Hide the translations and stick with the interpreter as long as one of the
+ * following conditions is true.
+ */
+static inline bool dvmJitHideTranslation()
+{
+    return (gDvm.sumThreadSuspendCount != 0) ||
+           (gDvmJit.codeCacheFull == true) ||
+           (gDvmJit.pProfTable == NULL);
+}
+
+/*
+ * The fast and debug interpreter may be doing ping-pong without making forward
+ * progress if the same trace building request sent upon entering the fast
+ * interpreter is rejected immediately by the debug interpreter. Use the
+ * following function to poll the rejection reasons and stay in the debug
+ * interpreter until they are cleared. This will guarantee forward progress
+ * in the extreme corner cases (eg set compiler threashold to 1).
+ */
+static inline bool dvmJitStayInPortableInterpreter()
+{
+    return dvmJitHideTranslation() ||
+           (gDvmJit.compilerQueueLength >= gDvmJit.compilerHighWater);
 }
 #endif
 

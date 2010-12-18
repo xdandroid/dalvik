@@ -448,7 +448,7 @@
     no arrays of <code>long</code> or <code>double</code>, but reference
     types are acceptable). The constructed
     instance is stored as a "result" in the same way that the method invocation
-    instructions store their results, so the constructed instance must 
+    instructions store their results, so the constructed instance must
     be moved to a register with an immediately subsequent
     <code>move-result-object</code> instruction (if it is to be used).</td>
 </tr>
@@ -712,11 +712,12 @@
     with an appropriate <code>move-result*</code> variant as the immediately
     subsequent instruction.
     <p><code>invoke-virtual</code> is used to invoke a normal virtual
-    method (a method that is not <code>static</code> or <code>final</code>,
-    and is not a constructor).</p>
+    method (a method that is not <code>private</code>, <code>static</code>,
+    or <code>final</code>, and is also not a constructor).</p>
     <p><code>invoke-super</code> is used to invoke the closest superclass's
     virtual method (as opposed to the one with the same <code>method_id</code>
-    in the calling class).</p>
+    in the calling class). The same method restrictions hold as for
+    <code>invoke-virtual</code>.</p>
     <p><code>invoke-direct</code> is used to invoke a non-<code>static</code>
     direct method (that is, an instance method that is by its nature
     non-overridable, namely either a <code>private</code> instance method
@@ -1453,7 +1454,7 @@ round-to-nearest and gradual underflow, except where stated otherwise.</p>
     float result = a % b;
   </td>
   <td>Floating point remainder after division. This function is different
-    than IEEE 754 remainder and is defined as 
+    than IEEE 754 remainder and is defined as
     <code>result == a - roundTowardZero(a / b) * b</code>.
   </td>
 </tr>
@@ -1491,7 +1492,7 @@ round-to-nearest and gradual underflow, except where stated otherwise.</p>
     double result = a % b;
   </td>
   <td>Floating point remainder after division. This function is different
-    than IEEE 754 remainder and is defined as 
+    than IEEE 754 remainder and is defined as
     <code>result == a - roundTowardZero(a / b) * b</code>.
   </td>
 </tr>

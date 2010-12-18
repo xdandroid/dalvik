@@ -13,36 +13,43 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 /*
  * Atomic operations
  */
 #ifndef _DALVIK_ATOMIC
 #define _DALVIK_ATOMIC
 
-#include <utils/Atomic.h>       /* use common Android atomic ops */
+#include <cutils/atomic.h>          /* use common Android atomic ops */
+#include <cutils/atomic-inline.h>   /* and some uncommon ones */
 
 /*
- * Memory barrier.  Guarantee that register-resident variables
- * are flushed to memory, and guarantee that instructions before
- * the barrier do not get reordered to appear past it.
+ * NOTE: Two "quasiatomic" operations on the exact same memory address
+ * are guaranteed to operate atomically with respect to each other,
+ * but no guarantees are made about quasiatomic operations mixed with
+ * non-quasiatomic operations on the same address, nor about
+ * quasiatomic operations that are performed on partially-overlapping
+ * memory.
  *
- * 'asm volatile ("":::"memory")' is probably overkill, but it's correct.
- * There may be a way to do it that doesn't flush every single register.
- *
- * TODO: look into the wmb() family on Linux and equivalents on other systems.
+ * None of these provide a memory barrier.
  */
-#define MEM_BARRIER()   do { asm volatile ("":::"memory"); } while (0)
 
 /*
- * Atomic compare-and-swap macro.
- *
- * If *_addr equals "_old", replace it with "_new" and return 1.  Otherwise
- * return 0.  (e.g. x86 "cmpxchgl" instruction.)
- *
- * Underlying function is currently declared:
- * int android_atomic_cmpxchg(int32_t old, int32_t new, volatile int32_t* addr)
+ * Swap the 64-bit value at "addr" with "value".  Returns the previous
+ * value.
  */
-#define ATOMIC_CMP_SWAP(_addr, _old, _new) \
-            (android_atomic_cmpxchg((_old), (_new), (_addr)) == 0)
+int64_t dvmQuasiAtomicSwap64(int64_t value, volatile int64_t* addr);
+
+/*
+ * Read the 64-bit value at "addr".
+ */
+int64_t dvmQuasiAtomicRead64(volatile const int64_t* addr);
+
+/*
+ * If the value at "addr" is equal to "oldvalue", replace it with "newvalue"
+ * and return 0.  Otherwise, don't swap, and return nonzero.
+ */
+int dvmQuasiAtomicCas64(int64_t oldvalue, int64_t newvalue,
+        volatile int64_t* addr);
 
 #endif /*_DALVIK_ATOMIC*/

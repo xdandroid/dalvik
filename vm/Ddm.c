@@ -285,8 +285,13 @@ void dvmDdmSendThreadNotification(Thread* thread, bool started)
     if (!gDvm.ddmThreadNotification)
         return;
 
-    StringObject* nameObj = (StringObject*)
-        dvmGetFieldObject(thread->threadObj, gDvm.offJavaLangThread_name);
+    StringObject* nameObj = NULL;
+    Object* threadObj = thread->threadObj;
+
+    if (threadObj != NULL) {
+        nameObj = (StringObject*)
+            dvmGetFieldObject(threadObj, gDvm.offJavaLangThread_name);
+    }
 
     int type, len;
     u1 buf[256];
@@ -411,7 +416,8 @@ static bool getThreadStats(pid_t pid, pid_t tid, unsigned long* pUtime,
     int cc;
     cc = read(fd, lineBuf, sizeof(lineBuf)-1);
     if (cc <= 0) {
-        LOGI("Unable to read '%s': got %d (errno=%d)\n", nameBuf, cc, errno);
+        const char* msg = (cc == 0) ? "unexpected EOF" : strerror(errno);
+        LOGI("Unable to read '%s': %s\n", nameBuf, msg);
         close(fd);
         return false;
     }
@@ -458,8 +464,8 @@ static bool getThreadStats(pid_t pid, pid_t tid, unsigned long* pUtime,
  *  (4b) threadId
  *  (1b) thread status
  *  (4b) tid
- *  (4b) utime 
- *  (4b) stime 
+ *  (4b) utime
+ *  (4b) stime
  *  (1b) is daemon?
  *
  * The length fields exist in anticipation of adding additional fields
@@ -499,15 +505,18 @@ ArrayObject* dvmDdmGenerateThreadStats(void)
     pid_t pid = getpid();
     for (thread = gDvm.threadList; thread != NULL; thread = thread->next) {
         unsigned long utime, stime;
-        bool isDaemon;
+        bool isDaemon = false;
 
         if (!getThreadStats(pid, thread->systemTid, &utime, &stime)) {
             // failed; drop in empty values
             utime = stime = 0;
         }
 
-        isDaemon = dvmGetFieldBoolean(thread->threadObj,
-                        gDvm.offJavaLangThread_daemon);
+        Object* threadObj = thread->threadObj;
+        if (threadObj != NULL) {
+            isDaemon = dvmGetFieldBoolean(threadObj,
+                            gDvm.offJavaLangThread_daemon);
+        }
 
         set4BE(buf+0, thread->threadId);
         set1(buf+4, thread->status);
@@ -595,4 +604,3 @@ ArrayObject* dvmDdmGetRecentAllocations(void)
         memcpy(arrayObj->contents, data, len);
     return arrayObj;
 }
-

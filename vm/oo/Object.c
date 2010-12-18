@@ -85,7 +85,7 @@ InstField* dvmFindInstanceFieldHier(const ClassObject* clazz,
 StaticField* dvmFindStaticField(const ClassObject* clazz,
     const char* fieldName, const char* signature)
 {
-    StaticField* pField;
+    const StaticField* pField;
     int i;
 
     assert(clazz != NULL);
@@ -95,12 +95,12 @@ StaticField* dvmFindStaticField(const ClassObject* clazz,
      * fields, the VM allows you to have two fields with the same name so
      * long as they have different types.
      */
-    pField = clazz->sfields;
+    pField = &clazz->sfields[0];
     for (i = 0; i < clazz->sfieldCount; i++, pField++) {
         if (strcmp(fieldName, pField->field.name) == 0 &&
             strcmp(signature, pField->field.signature) == 0)
         {
-            return pField;
+            return (StaticField*) pField;
         }
     }
 
@@ -216,7 +216,7 @@ static inline int compareMethodHelper(Method* method, const char* methodName,
     }
 
     proto = &method->prototype;
-        
+
     if (strcmp(returnType, dexProtoGetReturnType(proto)) != 0) {
         return 1;
     }
@@ -256,7 +256,7 @@ static inline int compareMethodHelper(Method* method, const char* methodName,
  * and also find a pointer to the return type.
  */
 static inline size_t countArgsAndFindReturnType(const char* descriptor,
-    const char** pReturnType) 
+    const char** pReturnType)
 {
     size_t count = 0;
     bool bogus = false;
@@ -264,7 +264,7 @@ static inline size_t countArgsAndFindReturnType(const char* descriptor,
 
     assert(*descriptor == '(');
     descriptor++;
-    
+
     while (!done) {
         switch (*descriptor) {
             case 'B': case 'C': case 'D': case 'F':
@@ -297,7 +297,7 @@ static inline size_t countArgsAndFindReturnType(const char* descriptor,
                 break;
             }
             case ')': {
-                /* 
+                /*
                  * Note: The loop will exit after incrementing descriptor
                  * one more time, so it then points at the return type.
                  */
@@ -336,7 +336,7 @@ static inline void copyTypes(char* buffer, const char** argTypes,
 
     /* Skip the '('. */
     descriptor++;
-    
+
     for (i = 0; i < argCount; i++) {
         argTypes[i] = buffer;
 
@@ -353,9 +353,9 @@ static inline void copyTypes(char* buffer, const char** argTypes,
                 *(buffer++) = c;
             } while (c != ';');
         }
-        
+
         *(buffer++) = '\0';
-    }        
+    }
 }
 
 /*
@@ -395,7 +395,7 @@ static Method* findMethodInListByDescriptor(const ClassObject* clazz,
             methods = clazz->directMethods;
             methodCount = clazz->directMethodCount;
         }
-        
+
         for (i = 0; i < methodCount; i++) {
             Method* method = &methods[i];
             if (compareMethodHelper(method, name, returnType, argCount,
@@ -424,7 +424,7 @@ static Method* findMethodInListByDescriptor(const ClassObject* clazz,
  */
 static Method* findMethodInListByProto(const ClassObject* clazz,
     MethodType wantedType, bool isHier, const char* name, const DexProto* proto)
-{    
+{
     while (clazz != NULL) {
         int i;
 
@@ -694,17 +694,17 @@ void dvmDumpObject(const Object* obj)
     int i;
 
     if (obj == NULL || obj->clazz == NULL) {
-        LOGW("Null or malformed object not dumped\n");
+        LOGW("Null or malformed object not dumped");
         return;
     }
 
     clazz = obj->clazz;
-    LOGD("----- Object dump: %p (%s, %d bytes) -----\n",
+    LOGD("----- Object dump: %p (%s, %d bytes) -----",
         obj, clazz->descriptor, (int) clazz->objectSize);
     //printHexDump(obj, clazz->objectSize);
-    LOGD("  Fields:\n");
+    LOGD("  Fields:");
     while (clazz != NULL) {
-        LOGD("    -- %s\n", clazz->descriptor);
+        LOGD("    -- %s", clazz->descriptor);
         for (i = 0; i < clazz->ifieldCount; i++) {
             const InstField* pField = &clazz->ifields[i];
             char type = pField->field.signature[0];
@@ -717,7 +717,7 @@ void dvmDumpObject(const Object* obj)
                 else
                     dval = dvmGetFieldDouble(obj, pField->byteOffset);
 
-                LOGD("    %2d: '%s' '%s' af=%04x off=%d %.3f\n", i,
+                LOGD("    %2d: '%s' '%s' af=%04x off=%d %.3f", i,
                     pField->field.name, pField->field.signature,
                     pField->field.accessFlags, pField->byteOffset, dval);
             } else {
@@ -730,7 +730,7 @@ void dvmDumpObject(const Object* obj)
                 else
                     lval = dvmGetFieldInt(obj, pField->byteOffset);
 
-                LOGD("    %2d: '%s' '%s' af=%04x off=%d 0x%08llx\n", i,
+                LOGD("    %2d: '%s' '%s' af=%04x off=%d 0x%08llx", i,
                     pField->field.name, pField->field.signature,
                     pField->field.accessFlags, pField->byteOffset, lval);
             }
@@ -738,5 +738,39 @@ void dvmDumpObject(const Object* obj)
 
         clazz = clazz->super;
     }
-}
+    if (obj->clazz == gDvm.classJavaLangClass) {
+        LOGD("  Static fields:");
+        const StaticField* sfields = &((ClassObject *)obj)->sfields[0];
+        for (i = 0; i < ((ClassObject *)obj)->sfieldCount; ++i) {
+            const StaticField* pField = &sfields[i];
+            size_t byteOffset = (size_t)pField - (size_t)sfields;
+            char type = pField->field.signature[0];
 
+            if (type == 'F' || type == 'D') {
+                double dval;
+
+                if (type == 'F')
+                    dval = pField->value.f;
+                else
+                    dval = pField->value.d;
+
+                LOGD("    %2d: '%s' '%s' af=%04x off=%zd %.3f", i,
+                     pField->field.name, pField->field.signature,
+                     pField->field.accessFlags, byteOffset, dval);
+            } else {
+                u8 lval;
+
+                if (type == 'J')
+                    lval = pField->value.j;
+                else if (type == 'Z')
+                    lval = pField->value.z;
+                else
+                    lval = pField->value.i;
+
+                LOGD("    %2d: '%s' '%s' af=%04x off=%zd 0x%08llx", i,
+                     pField->field.name, pField->field.signature,
+                     pField->field.accessFlags, byteOffset, lval);
+            }
+        }
+    }
+}

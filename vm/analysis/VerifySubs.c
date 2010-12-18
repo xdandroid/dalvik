@@ -32,51 +32,34 @@
  * If "pNewInstanceCount" is not NULL, it will be set to the number of
  * new-instance instructions in the method.
  *
+ * Performs some static checks, notably:
+ * - opcode of first instruction begins at index 0
+ * - only documented instructions may appear
+ * - each instruction follows the last
+ * - last byte of last instruction is at (code_length-1)
+ *
  * Logs an error and returns "false" on failure.
  */
 bool dvmComputeCodeWidths(const Method* meth, InsnFlags* insnFlags,
     int* pNewInstanceCount)
 {
-    const int insnCount = dvmGetMethodInsnsSize(meth);
+    size_t insnCount = dvmGetMethodInsnsSize(meth);
     const u2* insns = meth->insns;
     bool result = false;
     int newInstanceCount = 0;
     int i;
 
 
-    for (i = 0; i < insnCount; /**/) {
-        int width;
-
-        /*
-         * Switch tables and array data tables are identified with
-         * "extended NOP" opcodes.  They contain no executable code,
-         * so we can just skip past them.
-         */
-        if (*insns == kPackedSwitchSignature) {
-            width = 4 + insns[1] * 2;
-        } else if (*insns == kSparseSwitchSignature) {
-            width = 2 + insns[1] * 4;
-        } else if (*insns == kArrayDataSignature) {
-            u4 size = insns[2] | (((u4)insns[3]) << 16);
-            width = 4 + (insns[1] * size + 1) / 2;
-        } else {
-            int instr = *insns & 0xff;
-            width = dexGetInstrWidthAbs(gDvm.instrWidth, instr);
-            if (width == 0) {
-                LOG_VFY_METH(meth,
-                    "VFY: invalid post-opt instruction (0x%x)\n", instr);
-                LOGI("### instr=%d width=%d table=%d\n",
-                    instr, width, dexGetInstrWidthAbs(gDvm.instrWidth, instr));
-                goto bail;
-            }
-            if (width < 0 || width > 5) {
-                LOGE("VFY: bizarre width value %d\n", width);
-                dvmAbort();
-            }
-
-            if (instr == OP_NEW_INSTANCE)
-                newInstanceCount++;
+    for (i = 0; i < (int) insnCount; /**/) {
+        size_t width = dexGetInstrOrTableWidthAbs(gDvm.instrWidth, insns);
+        if (width == 0) {
+            LOG_VFY_METH(meth,
+                "VFY: invalid post-opt instruction (0x%04x)\n", *insns);
+            goto bail;
         }
+
+        if ((*insns & 0xff) == OP_NEW_INSTANCE)
+            newInstanceCount++;
 
         if (width > 65535) {
             LOG_VFY_METH(meth, "VFY: insane width %d\n", width);
@@ -113,7 +96,6 @@ bail:
 bool dvmSetTryFlags(const Method* meth, InsnFlags* insnFlags)
 {
     u4 insnsSize = dvmGetMethodInsnsSize(meth);
-    DexFile* pDexFile = meth->clazz->pDvmDex->pDexFile;
     const DexCode* pCode = dvmGetMethodCode(meth);
     u4 triesSize = pCode->triesSize;
     const DexTry* pTries;
@@ -194,18 +176,19 @@ bool dvmSetTryFlags(const Method* meth, InsnFlags* insnFlags)
 bool dvmCheckSwitchTargets(const Method* meth, InsnFlags* insnFlags,
     int curOffset)
 {
-    const int insnCount = dvmGetMethodInsnsSize(meth);
+    const s4 insnCount = dvmGetMethodInsnsSize(meth);
     const u2* insns = meth->insns + curOffset;
     const u2* switchInsns;
     u2 expectedSignature;
-    int switchCount, tableSize;
-    int offsetToSwitch, offsetToKeys, offsetToTargets, targ;
-    int offset, absOffset;
+    u4 switchCount, tableSize;
+    s4 offsetToSwitch, offsetToKeys, offsetToTargets;
+    s4 offset, absOffset;
+    u4 targ;
 
     assert(curOffset >= 0 && curOffset < insnCount);
 
     /* make sure the start of the switch is in range */
-    offsetToSwitch = (s2) insns[1];
+    offsetToSwitch = insns[1] | ((s4) insns[2]) << 16;
     if (curOffset + offsetToSwitch < 0 ||
         curOffset + offsetToSwitch + 2 >= insnCount)
     {
@@ -249,7 +232,7 @@ bool dvmCheckSwitchTargets(const Method* meth, InsnFlags* insnFlags,
     }
 
     /* make sure the end of the switch is in range */
-    if (curOffset + offsetToSwitch + tableSize > insnCount) {
+    if (curOffset + offsetToSwitch + tableSize > (u4) insnCount) {
         LOG_VFY_METH(meth,
             "VFY: invalid switch end: at %d, switch offset %d, end %d, count %d\n",
             curOffset, offsetToSwitch, curOffset + offsetToSwitch + tableSize,
@@ -311,7 +294,6 @@ bool dvmCheckBranchTarget(const Method* meth, InsnFlags* insnFlags,
     int curOffset, bool selfOkay)
 {
     const int insnCount = dvmGetMethodInsnsSize(meth);
-    const u2* insns = meth->insns + curOffset;
     int offset, absOffset;
     bool isConditional;
 
@@ -411,7 +393,6 @@ bool dvmGetBranchTarget(const Method* meth, InsnFlags* insnFlags,
     int curOffset, int* pOffset, bool* pConditional)
 {
     const u2* insns = meth->insns + curOffset;
-    int tmp;
 
     switch (*insns & 0xff) {
     case OP_GOTO:
@@ -474,4 +455,3 @@ char dvmDetermineCat1Const(s4 value)
     else
         return kRegTypeInteger;
 }
-

@@ -276,14 +276,14 @@ tryArchive:
             if (newFile) {
                 u8 startWhen, extractWhen, endWhen;
                 bool result;
-                off_t dexOffset, fileLen;
+                off_t dexOffset;
 
                 dexOffset = lseek(fd, 0, SEEK_CUR);
                 result = (dexOffset > 0);
 
                 if (result) {
                     startWhen = dvmGetRelativeTimeUsec();
-                    result = dexZipExtractEntryToFile(&archive, entry, fd);
+                    result = dexZipExtractEntryToFile(&archive, entry, fd) == 0;
                     extractWhen = dvmGetRelativeTimeUsec();
                 }
                 if (result) {
@@ -368,4 +368,3 @@ void dvmJarFileFree(JarFile* pJarFile)
     free(pJarFile->cacheFileName);
     free(pJarFile);
 }
-

@@ -231,6 +231,18 @@ INLINE u8 dvmGetRelativeTimeUsec(void) {
 }
 
 /*
+ * Get the current time, in milliseconds.  This is "relative" time,
+ * meaning it could be wall-clock time or a monotonic counter, and is
+ * only suitable for computing time deltas.  The value returned from
+ * this function is a u4 and should only be used for debugging
+ * messages.  TODO: make this value relative to the start-up time of
+ * the VM.
+ */
+INLINE u4 dvmGetRelativeTimeMsec(void) {
+    return (u4)(dvmGetRelativeTimeUsec() / 1000);
+}
+
+/*
  * Get the current per-thread CPU time.  This clock increases monotonically
  * when the thread is running, but not when it's sleeping or blocked on a
  * synchronization object.
@@ -286,5 +298,31 @@ void dvmAbort(void);
 /* Implementation of strlcpy() for platforms that don't already have it. */
 size_t strlcpy(char *dst, const char *src, size_t size);
 #endif
+
+/*
+ *  Allocates a memory region using ashmem and mmap, initialized to
+ *  zero.  Actual allocation rounded up to page multiple.  Returns
+ *  NULL on failure.
+ */
+void *dvmAllocRegion(size_t size, int prot, const char *name);
+
+/*
+ * Returns the pointer to the "absolute path" part of the given path
+ * string, treating first (if any) instance of "/./" as a sentinel
+ * indicating the start of the absolute path. If the path isn't absolute
+ * in the usual way (i.e., starts with "/") and doesn't have the sentinel,
+ * then this returns NULL.
+ *
+ * For example:
+ *     "/foo/bar/baz" returns "/foo/bar/baz"
+ *     "foo/./bar/baz" returns "/bar/baz"
+ *     "foo/bar/baz" returns NULL
+ *
+ * The sentinel is used specifically to aid in cross-optimization, where
+ * a host is processing dex files in a build tree, and where we don't want
+ * the build tree's directory structure to be baked into the output (such
+ * as, for example, in the dependency paths of optimized dex files).
+ */
+const char* dvmPathToAbsolutePortion(const char* path);
 
 #endif /*_DALVIK_MISC*/

@@ -26,14 +26,12 @@
 #
 LOCAL_CFLAGS += -fstrict-aliasing -Wstrict-aliasing=2 -fno-align-jumps
 #LOCAL_CFLAGS += -DUSE_INDIRECT_REF
+LOCAL_CFLAGS += -Wall -Wextra -Wno-unused-parameter
+LOCAL_CFLAGS += -DARCH_VARIANT=\"$(dvm_arch_variant)\"
 
 #
 # Optional features.  These may impact the size or performance of the VM.
 #
-LOCAL_CFLAGS += -DWITH_PROFILER -DWITH_DEBUGGER
-
-# 0=full cache, 1/2=reduced, 3=no cache
-LOCAL_CFLAGS += -DDVM_RESOLVER_CACHE=0
 
 ifeq ($(WITH_DEADLOCK_PREDICTION),true)
   LOCAL_CFLAGS += -DWITH_DEADLOCK_PREDICTION
@@ -98,6 +96,7 @@ endif  # !dvm_make_debug_vm
 
 LOCAL_SRC_FILES := \
 	AllocTracker.c \
+	Atomic.c.arm \
 	AtomicCache.c \
 	CheckJni.c \
 	Ddm.c \
@@ -128,18 +127,19 @@ LOCAL_SRC_FILES := \
 	UtfString.c \
 	alloc/clz.c.arm \
 	alloc/Alloc.c \
+	alloc/CardTable.c \
 	alloc/HeapBitmap.c.arm \
 	alloc/HeapDebug.c \
-	alloc/HeapSource.c \
 	alloc/HeapTable.c \
 	alloc/HeapWorker.c \
 	alloc/Heap.c.arm \
-	alloc/MarkSweep.c.arm \
 	alloc/DdmHeap.c \
+	alloc/Verify.c \
+	alloc/Visit.c \
 	analysis/CodeVerify.c \
-	analysis/DexOptimize.c \
+	analysis/DexPrepare.c \
 	analysis/DexVerify.c \
-	analysis/ReduceConstants.c \
+	analysis/Optimize.c \
 	analysis/RegisterMap.c \
 	analysis/VerifySubs.c \
 	interp/Interp.c.arm \
@@ -156,7 +156,6 @@ LOCAL_SRC_FILES := \
 	mterp/out/InterpC-portdbg.c.arm \
 	native/InternalNative.c \
 	native/dalvik_system_DexFile.c \
-	native/dalvik_system_SamplingProfiler.c \
 	native/dalvik_system_VMDebug.c \
 	native/dalvik_system_VMRuntime.c \
 	native/dalvik_system_VMStack.c \
@@ -182,7 +181,6 @@ LOCAL_SRC_FILES := \
 	native/org_apache_harmony_dalvik_ddmc_DdmServer.c \
 	native/org_apache_harmony_dalvik_ddmc_DdmVmInternal.c \
 	native/sun_misc_Unsafe.c \
-	native/SystemThread.c \
 	oo/AccessCheck.c \
 	oo/Array.c \
 	oo/Class.c \
@@ -192,19 +190,31 @@ LOCAL_SRC_FILES := \
 	reflect/Annotation.c \
 	reflect/Proxy.c \
 	reflect/Reflect.c \
-	test/AtomicSpeed.c \
+	test/AtomicTest.c.arm \
 	test/TestHash.c \
 	test/TestIndirectRefTable.c
+
+WITH_COPYING_GC := $(strip $(WITH_COPYING_GC))
+
+ifeq ($(WITH_COPYING_GC),true)
+  LOCAL_CFLAGS += -DWITH_COPYING_GC
+  LOCAL_SRC_FILES += \
+	alloc/Copying.c.arm
+else
+  LOCAL_SRC_FILES += \
+	alloc/HeapSource.c \
+	alloc/MarkSweep.c.arm
+endif
 
 WITH_JIT := $(strip $(WITH_JIT))
 
 ifeq ($(WITH_JIT),true)
   LOCAL_CFLAGS += -DWITH_JIT
   LOCAL_SRC_FILES += \
-	../dexdump/OpCodeNames.c \
 	compiler/Compiler.c \
 	compiler/Frontend.c \
 	compiler/Utility.c \
+	compiler/InlineTransformation.c \
 	compiler/IntermediateRep.c \
 	compiler/Dataflow.c \
 	compiler/Loop.c \
@@ -225,10 +235,6 @@ ifeq ($(WITH_HPROF),true)
 	hprof/HprofString.c
   LOCAL_CFLAGS += -DWITH_HPROF=1
 
-  ifeq ($(strip $(WITH_HPROF_UNREACHABLE)),true)
-    LOCAL_CFLAGS += -DWITH_HPROF_UNREACHABLE=1
-  endif
-
   ifeq ($(strip $(WITH_HPROF_STACK)),true)
     LOCAL_SRC_FILES += \
 	hprof/HprofStack.c \
@@ -236,10 +242,6 @@ ifeq ($(WITH_HPROF),true)
     LOCAL_CFLAGS += -DWITH_HPROF_STACK=1
   endif # WITH_HPROF_STACK
 endif   # WITH_HPROF
-
-ifeq ($(strip $(DVM_TRACK_HEAP_MARKING)),true)
-  LOCAL_CFLAGS += -DDVM_TRACK_HEAP_MARKING=1
-endif
 
 LOCAL_C_INCLUDES += \
 	$(JNI_H_INCLUDE) \
@@ -255,10 +257,6 @@ ifeq ($(dvm_simulator),true)
     # need this for clock_gettime() in profiling
     LOCAL_LDLIBS += -lrt
   endif
-else
-  ifeq ($(dvm_os),linux)
-    LOCAL_SHARED_LIBRARIES += libdl
-  endif
 endif
 
 MTERP_ARCH_KNOWN := false
@@ -266,6 +264,7 @@ MTERP_ARCH_KNOWN := false
 ifeq ($(dvm_arch),arm)
   #dvm_arch_variant := armv7-a
   #LOCAL_CFLAGS += -march=armv7-a -mfloat-abi=softfp -mfpu=vfp
+  LOCAL_CFLAGS += -Werror
   MTERP_ARCH_KNOWN := true
   # Select architecture-specific sources (armv4t, armv5te etc.)
   LOCAL_SRC_FILES += \

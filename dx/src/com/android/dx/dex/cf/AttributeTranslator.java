@@ -84,7 +84,7 @@ import java.util.ArrayList;
      * combines both visible and invisible annotations into a single
      * result set and also adds in a system annotation for the
      * {@code Signature} attribute if present.
-     * 
+     *
      * @param attribs {@code non-null;} the attributes list to search in
      * @return {@code non-null;} the set of annotations, which may be empty
      */
@@ -107,7 +107,7 @@ import java.util.ArrayList;
      * class is an annotation class, then this also includes a
      * representation of all the {@code AnnotationDefault}
      * values.
-     * 
+     *
      * @param cf {@code non-null;} the class in question
      * @param args {@code non-null;} the high-level options
      * @return {@code non-null;} the set of annotations, which may be empty
@@ -149,7 +149,7 @@ import java.util.ArrayList;
      * Gets the annotations out of a given method, similar to {@link
      * #getAnnotations}, also including an annotation for the translation
      * of the method-specific attribute {@code Exceptions}.
-     * 
+     *
      * @param method {@code non-null;} the method in question
      * @return {@code non-null;} the set of annotations, which may be empty
      */
@@ -158,18 +158,18 @@ import java.util.ArrayList;
         TypeList exceptions = getExceptions(method);
 
         if (exceptions.size() != 0) {
-            Annotation throwsAnnotation = 
+            Annotation throwsAnnotation =
                 AnnotationUtils.makeThrows(exceptions);
             result = Annotations.combine(result, throwsAnnotation);
         }
 
         return result;
     }
-    
+
     /**
      * Helper method for {@link #getAnnotations} which just gets the
      * existing annotations, per se.
-     * 
+     *
      * @param attribs {@code non-null;} the attributes list to search in
      * @return {@code non-null;} the set of annotations, which may be empty
      */
@@ -201,7 +201,7 @@ import java.util.ArrayList;
     /**
      * Gets the {@code Signature} attribute out of a given
      * {@link AttributeList}, if any, translating it to an annotation.
-     * 
+     *
      * @param attribs {@code non-null;} the attributes list to search in
      * @return {@code null-ok;} the converted {@code Signature} annotation,
      * if there was an attribute to translate
@@ -223,7 +223,7 @@ import java.util.ArrayList;
      * If the class really has an enclosing method, this returns an
      * {@code EnclosingMethod} annotation; if not, this returns
      * an {@code EnclosingClass} annotation.
-     * 
+     *
      * @param attribs {@code non-null;} the attributes list to search in
      * @return {@code null-ok;} the converted {@code EnclosingMethod} or
      * {@code EnclosingClass} annotation, if there was an
@@ -260,8 +260,9 @@ import java.util.ArrayList;
      * {@link AttributeList}, if any, translating it to one or more of an
      * {@code InnerClass}, {@code EnclosingClass}, or
      * {@code MemberClasses} annotation.
-     * 
-     * @param thisClass {@code non-null;} type representing the class being processed
+     *
+     * @param thisClass {@code non-null;} type representing the class being
+     * processed
      * @param attribs {@code non-null;} the attributes list to search in
      * @param needEnclosingClass whether to include an
      * {@code EnclosingClass} annotation
@@ -298,7 +299,7 @@ import java.util.ArrayList;
         }
 
         int membersSize = membersList.size();
-        
+
         if ((foundThisClass == null) && (membersSize == 0)) {
             return null;
         }
@@ -314,10 +315,20 @@ import java.util.ArrayList;
                 if (outer == null) {
                     throw new Warning(
                             "Ignoring InnerClasses attribute for an " +
-                            "anonymous inner class that doesn't come with " +
-                            "an associated EnclosingMethod attribute. " +
-                            "(This class was probably produced by a broken " +
-                            "compiler.)");
+                            "anonymous inner class\n" +
+                            "(" + thisClass.toHuman() +
+                            ") that doesn't come with an\n" +
+                            "associated EnclosingMethod attribute. " +
+                            "This class was probably produced by a\n" +
+                            "compiler that did not target the modern " +
+                            ".class file format. The recommended\n" +
+                            "solution is to recompile the class from " +
+                            "source, using an up-to-date compiler\n" +
+                            "and without specifying any \"-target\" type " +
+                            "options. The consequence of ignoring\n" +
+                            "this warning is that reflective operations " +
+                            "on this class will incorrectly\n" +
+                            "indicate that it is *not* an inner class.");
                 }
                 result.add(AnnotationUtils.makeEnclosingClass(
                                    foundThisClass.getOuterClass()));
@@ -341,9 +352,10 @@ import java.util.ArrayList;
      * Gets the parameter annotations out of a given method. This
      * combines both visible and invisible annotations into a single
      * result set.
-     * 
+     *
      * @param method {@code non-null;} the method in question
-     * @return {@code non-null;} the list of annotation sets, which may be empty
+     * @return {@code non-null;} the list of annotation sets, which may be
+     * empty
      */
     public static AnnotationsList getParameterAnnotations(Method method) {
         AttributeList attribs = method.getAttributes();
@@ -377,7 +389,7 @@ import java.util.ArrayList;
      * Gets the {@code AnnotationDefault} attributes out of a
      * given class, if any, reforming them as an
      * {@code AnnotationDefault} annotation.
-     * 
+     *
      * @param cf {@code non-null;} the class in question
      * @return {@code null-ok;} an appropriately-constructed
      * {@code AnnotationDefault} annotation, if there were any

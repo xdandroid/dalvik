@@ -80,7 +80,7 @@ int sysMapFileInShmemWritableReadOnly(int fd, MemMapping* pMap);
 /*
  * Like sysMapFileInShmemReadOnly, but on only part of a file.
  */
-int sysMapFileSegmentInShmem(int fd, off_t start, long length,
+int sysMapFileSegmentInShmem(int fd, off_t start, size_t length,
     MemMapping* pMap);
 
 /*
@@ -105,5 +105,12 @@ int sysChangeMapAccess(void* addr, size_t length, int wantReadWrite,
  * This does not free "pMap"; it just releases the memory.
  */
 void sysReleaseShmem(MemMapping* pMap);
+
+/*
+ * Write until all bytes have been written.
+ *
+ * Returns 0 on success, or an errno value on failure.
+ */
+int sysWriteFully(int fd, const void* buf, size_t count, const char* logMsg);
 
 #endif /*_DALVIK_SYSUTIL*/

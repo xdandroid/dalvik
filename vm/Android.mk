@@ -32,20 +32,25 @@ LOCAL_PATH:= $(call my-dir)
 # Build for the target (device).
 #
 
-# Screw that, we do what we want
-#ifeq ($(TARGET_ARCH_VARIANT),armv5te)
-#    WITH_JIT := false
-#endif
+ifeq ($(TARGET_CPU_SMP),true)
+    target_smp_flag := -DANDROID_SMP=1
+else
+    target_smp_flag := -DANDROID_SMP=0
+endif
+host_smp_flag := -DANDROID_SMP=1
 
 # Build the installed version (libdvm.so) first
 include $(LOCAL_PATH)/ReconfigureDvm.mk
 
 # Overwrite default settings
+ifneq ($(TARGET_ARCH),x86)
 ifeq ($(TARGET_SIMULATOR),false)
     LOCAL_PRELINK_MODULE := true
 endif
-LOCAL_MODULE_TAGS := user
+endif
+LOCAL_MODULE_TAGS := optional
 LOCAL_MODULE := libdvm
+LOCAL_CFLAGS += $(target_smp_flag)
 include $(BUILD_SHARED_LIBRARY)
 
 # If WITH_JIT is configured, build multiple versions of libdvm.so to facilitate
@@ -58,7 +63,7 @@ ifeq ($(WITH_JIT),true)
 
     # Enable assertions and JIT-tuning
     LOCAL_CFLAGS += -UNDEBUG -DDEBUG=1 -DLOG_NDEBUG=1 -DWITH_DALVIK_ASSERT \
-				    -DWITH_JIT_TUNING -DJIT_STATS
+                    -DWITH_JIT_TUNING $(target_smp_flag)
     LOCAL_MODULE := libdvm_assert
     include $(BUILD_SHARED_LIBRARY)
 
@@ -68,7 +73,7 @@ ifeq ($(WITH_JIT),true)
 
     # Enable assertions and JIT self-verification
     LOCAL_CFLAGS += -UNDEBUG -DDEBUG=1 -DLOG_NDEBUG=1 -DWITH_DALVIK_ASSERT \
-					-DWITH_SELF_VERIFICATION
+                    -DWITH_SELF_VERIFICATION $(target_smp_flag)
     LOCAL_MODULE := libdvm_sv
     include $(BUILD_SHARED_LIBRARY)
 
@@ -77,6 +82,7 @@ ifeq ($(WITH_JIT),true)
     WITH_JIT := false
     include $(LOCAL_PATH)/ReconfigureDvm.mk
 
+    LOCAL_CFLAGS += $(target_smp_flag)
     LOCAL_MODULE := libdvm_interp
     include $(BUILD_SHARED_LIBRARY)
 
@@ -93,20 +99,24 @@ ifeq ($(WITH_HOST_DALVIK),true)
     # Variables used in the included Dvm.mk.
     dvm_os := $(HOST_OS)
     dvm_arch := $(HOST_ARCH)
-    dvm_arch_variant := $(HOST_ARCH_VARIANT)
+    # Note: HOST_ARCH_VARIANT isn't defined.
+    dvm_arch_variant := $(HOST_ARCH)
     dvm_simulator := false
 
     include $(LOCAL_PATH)/Dvm.mk
 
-    # We need to include all of these libraries. The end result of this
-    # section is a static library, but LOCAL_STATIC_LIBRARIES doesn't
-    # actually cause any code from the specified libraries to be included,
-    # whereas LOCAL_WHOLE_STATIC_LIBRARIES does. No, I (danfuzz) am not
-    # entirely sure what LOCAL_STATIC_LIBRARIES is even supposed to mean
-    # in this context, but it is in (apparently) meaningfully used in
-    # other parts of the build.
-    LOCAL_WHOLE_STATIC_LIBRARIES += \
-	libnativehelper-host libdex liblog libcutils
+    LOCAL_SHARED_LIBRARIES += libcrypto libssl libicuuc libicui18n
+
+    LOCAL_LDLIBS := -lpthread -ldl
+    ifeq ($(HOST_OS),linux)
+      # need this for clock_gettime() in profiling
+      LOCAL_LDLIBS += -lrt
+    endif
+
+    # Build as a WHOLE static library so dependencies are available at link
+    # time. When building this target as a regular static library, certain
+    # dependencies like expat are not found by the linker.
+    LOCAL_WHOLE_STATIC_LIBRARIES += libexpat libcutils libdex liblog libnativehelper libutils libz
 
     # The libffi from the source tree should never be used by host builds.
     # The recommendation is that host builds should always either
@@ -118,8 +128,10 @@ ifeq ($(WITH_HOST_DALVIK),true)
             $(patsubst libffi, ,$(LOCAL_SHARED_LIBRARIES))
     endif
 
-    LOCAL_MODULE := libdvm-host
+    LOCAL_CFLAGS += $(host_smp_flag)
+    LOCAL_MODULE_TAGS := optional
+    LOCAL_MODULE := libdvm
 
-    include $(BUILD_HOST_STATIC_LIBRARY)
+    include $(BUILD_HOST_SHARED_LIBRARY)
 
 endif

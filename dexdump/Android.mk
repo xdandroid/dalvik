@@ -18,8 +18,7 @@
 LOCAL_PATH:= $(call my-dir)
 
 dexdump_src_files := \
-		DexDump.c \
-		OpCodeNames.c
+		DexDump.c
 
 dexdump_c_includes := \
 		dalvik \
@@ -44,7 +43,7 @@ LOCAL_C_INCLUDES := $(dexdump_c_includes)
 LOCAL_SHARED_LIBRARIES := $(dexdump_shared_libraries) libz liblog
 LOCAL_STATIC_LIBRARIES := $(dexdump_static_libraries)
 LOCAL_MODULE_PATH := $(TARGET_OUT_OPTIONAL_EXECUTABLES)
-LOCAL_MODULE_TAGS := debug
+LOCAL_MODULE_TAGS := optional
 LOCAL_LDLIBS +=
 include $(BUILD_EXECUTABLE)
 
@@ -59,6 +58,7 @@ endif # !SDK_ONLY
 ifneq ($(TARGET_SIMULATOR),true) # not 64 bit clean
 include $(CLEAR_VARS)
 LOCAL_MODULE := dexdump
+LOCAL_MODULE_TAGS := optional
 LOCAL_SRC_FILES := $(dexdump_src_files)
 LOCAL_C_INCLUDES := $(dexdump_c_includes)
 LOCAL_SHARED_LIBRARIES := $(dexdump_shared_libraries)
@@ -72,4 +72,3 @@ endif
 
 include $(BUILD_HOST_EXECUTABLE)
 endif # !TARGET_SIMULATOR
-

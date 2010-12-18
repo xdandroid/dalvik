@@ -63,17 +63,16 @@ typedef struct AtomicCache {
  * Do a cache lookup.  We need to be able to read and write entries
  * atomically.  There are a couple of ways to do this:
  *  (1) Have a global lock.  A mutex is too heavy, so instead we would use
- *      an atomic flag.  If the flag is set, we could sit and spin, but
- *      if we're a high-priority thread that may cause a lockup.  Better
- *      to just ignore the cache and do the full computation.
+ *      an atomic flag.  If the flag is set, we could sit and spin,
+ *      but if we're a high-priority thread that may cause a lockup.
+ *      Better to just ignore the cache and do the full computation.
  *  (2) Have a "version" that gets incremented atomically when a write
  *      begins and again when it completes.  Compare the version before
- *      and after doing reads.  So long as "version" is volatile the
- *      compiler will do the right thing, allowing us to skip atomic
- *      ops in the common read case.  The table updates are expensive,
- *      requiring two volatile writes and (for correctness on
- *      multiprocessor systems) memory barriers.  We also need some
- *      sort of lock to ensure that nobody else tries to start an
+ *      and after doing reads.  So long as we have memory barriers in the
+ *      right place the compiler and CPU will do the right thing, allowing
+ *      us to skip atomic ops in the common read case.  The table updates
+ *      are expensive, requiring two writes with barriers.  We also need
+ *      some sort of lock to ensure that nobody else tries to start an
  *      update while we're in the middle of one.
  *
  * We expect a 95+% hit rate for the things we use this for, so #2 is
@@ -96,27 +95,26 @@ typedef struct AtomicCache {
 #define ATOMIC_CACHE_LOOKUP(_cache, _cacheSize, _key1, _key2) ({            \
     AtomicCacheEntry* pEntry;                                               \
     int hash;                                                               \
-    u4 firstVersion;                                                        \
+    u4 firstVersion, secondVersion;                                         \
     u4 value;                                                               \
                                                                             \
     /* simple hash function */                                              \
     hash = (((u4)(_key1) >> 2) ^ (u4)(_key2)) & ((_cacheSize)-1);           \
     pEntry = (_cache)->entries + hash;                                      \
                                                                             \
-    /* volatile read */                                                     \
-    firstVersion = pEntry->version;                                         \
+    firstVersion = android_atomic_acquire_load((int32_t*)&pEntry->version); \
                                                                             \
     if (pEntry->key1 == (u4)(_key1) && pEntry->key2 == (u4)(_key2)) {       \
         /*                                                                  \
          * The fields match.  Get the value, then read the version a        \
          * second time to verify that we didn't catch a partial update.     \
          * We're also hosed if "firstVersion" was odd, indicating that      \
-         * an update was in progress before we got here.                    \
+         * an update was in progress before we got here (unlikely).         \
          */                                                                 \
-        value = pEntry->value;    /* must grab before next check */         \
+        value = android_atomic_acquire_load((int32_t*) &pEntry->value);     \
+        secondVersion = pEntry->version;                                    \
                                                                             \
-        if ((firstVersion & 0x01) != 0 || firstVersion != pEntry->version)  \
-        {                                                                   \
+        if ((firstVersion & 0x01) != 0 || firstVersion != secondVersion) {  \
             /*                                                              \
              * We clashed with another thread.  Instead of sitting and      \
              * spinning, which might not complete if we're a high priority  \

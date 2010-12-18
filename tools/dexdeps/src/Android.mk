@@ -21,7 +21,7 @@ include $(CLEAR_VARS)
 
 LOCAL_SRC_FILES := $(call all-subdir-java-files)
 LOCAL_JAR_MANIFEST := ../etc/manifest.txt
-
+LOCAL_MODULE_TAGS := optional
 LOCAL_MODULE:= dexdeps
 
 include $(BUILD_HOST_JAVA_LIBRARY)
@@ -29,4 +29,3 @@ include $(BUILD_HOST_JAVA_LIBRARY)
 INTERNAL_DALVIK_MODULES += $(LOCAL_INSTALLED_MODULE)
 
 include $(BUILD_DROIDDOC)
-

@@ -86,6 +86,8 @@ static void fillPhiNodeContents(CompilationUnit *cUnit)
 
 }
 
+#if 0
+/* Debugging routines */
 static void dumpConstants(CompilationUnit *cUnit)
 {
     int i;
@@ -126,12 +128,39 @@ static void dumpIVList(CompilationUnit *cUnit)
     }
 }
 
+static void dumpHoistedChecks(CompilationUnit *cUnit)
+{
+    LoopAnalysis *loopAnalysis = cUnit->loopAnalysis;
+    unsigned int i;
+
+    for (i = 0; i < loopAnalysis->arrayAccessInfo->numUsed; i++) {
+        ArrayAccessInfo *arrayAccessInfo =
+            GET_ELEM_N(loopAnalysis->arrayAccessInfo,
+                       ArrayAccessInfo*, i);
+        int arrayReg = DECODE_REG(
+            dvmConvertSSARegToDalvik(cUnit, arrayAccessInfo->arrayReg));
+        int idxReg = DECODE_REG(
+            dvmConvertSSARegToDalvik(cUnit, arrayAccessInfo->ivReg));
+        LOGE("Array access %d", i);
+        LOGE("  arrayReg %d", arrayReg);
+        LOGE("  idxReg %d", idxReg);
+        LOGE("  endReg %d", loopAnalysis->endConditionReg);
+        LOGE("  maxC %d", arrayAccessInfo->maxC);
+        LOGE("  minC %d", arrayAccessInfo->minC);
+        LOGE("  opcode %d", loopAnalysis->loopBranchOpcode);
+    }
+}
+
+#endif
+
 /*
  * A loop is considered optimizable if:
  * 1) It has one basic induction variable
  * 2) The loop back branch compares the BIV with a constant
  * 3) If it is a count-up loop, the condition is GE/GT, or LE/LT/LEZ/LTZ for
  *    a count-down loop.
+ *
+ * Return false if the loop is not optimizable.
  */
 static bool isLoopOptimizable(CompilationUnit *cUnit)
 {
@@ -146,6 +175,10 @@ static bool isLoopOptimizable(CompilationUnit *cUnit)
         ivInfo = GET_ELEM_N(loopAnalysis->ivList, InductionVariableInfo*, i);
         /* Count up or down loop? */
         if (ivInfo->ssaReg == ivInfo->basicSSAReg) {
+            /* Infinite loop */
+            if (ivInfo->inc == 0) {
+                return false;
+            }
             loopAnalysis->isCountUpLoop = ivInfo->inc > 0;
             break;
         }
@@ -180,11 +213,14 @@ static bool isLoopOptimizable(CompilationUnit *cUnit)
         }
         /*
          * If the comparison is not between the BIV and a loop invariant,
-         * return false.
+         * return false. endReg is loop invariant if one of the following is
+         * true:
+         * - It is not defined in the loop (ie DECODE_SUB returns 0)
+         * - It is reloaded with a constant
          */
         int endReg = dvmConvertSSARegToDalvik(cUnit, branch->ssaRep->uses[1]);
-
-        if (DECODE_SUB(endReg) != 0) {
+        if (DECODE_SUB(endReg) != 0 &&
+            !dvmIsBitSet(cUnit->isConstantV, branch->ssaRep->uses[1])) {
             return false;
         }
         loopAnalysis->endConditionReg = DECODE_REG(endReg);
@@ -263,11 +299,9 @@ static void updateRangeCheckInfo(CompilationUnit *cUnit, int arrayReg,
 /* Returns true if the loop body cannot throw any exceptions */
 static bool doLoopBodyCodeMotion(CompilationUnit *cUnit)
 {
-    BasicBlock *entry = cUnit->blockList[0];
     BasicBlock *loopBody = cUnit->blockList[1];
     MIR *mir;
     bool loopBodyCanThrow = false;
-    int numDalvikRegs = cUnit->method->registersSize;
 
     for (mir = loopBody->firstMIRInsn; mir; mir = mir->next) {
         DecodedInstruction *dInsn = &mir->dalvikInsn;
@@ -321,7 +355,6 @@ static bool doLoopBodyCodeMotion(CompilationUnit *cUnit)
             int useIdx = refIdx + 1;
             int subNRegArray =
                 dvmConvertSSARegToDalvik(cUnit, mir->ssaRep->uses[refIdx]);
-            int arrayReg = DECODE_REG(subNRegArray);
             int arraySub = DECODE_SUB(subNRegArray);
 
             /*
@@ -350,36 +383,11 @@ static bool doLoopBodyCodeMotion(CompilationUnit *cUnit)
     return !loopBodyCanThrow;
 }
 
-static void dumpHoistedChecks(CompilationUnit *cUnit)
-{
-    ArrayAccessInfo *arrayAccessInfo;
-    LoopAnalysis *loopAnalysis = cUnit->loopAnalysis;
-    unsigned int i;
-
-    for (i = 0; i < loopAnalysis->arrayAccessInfo->numUsed; i++) {
-        ArrayAccessInfo *arrayAccessInfo =
-            GET_ELEM_N(loopAnalysis->arrayAccessInfo,
-                       ArrayAccessInfo*, i);
-        int arrayReg = DECODE_REG(
-            dvmConvertSSARegToDalvik(cUnit, arrayAccessInfo->arrayReg));
-        int idxReg = DECODE_REG(
-            dvmConvertSSARegToDalvik(cUnit, arrayAccessInfo->ivReg));
-        LOGE("Array access %d", i);
-        LOGE("  arrayReg %d", arrayReg);
-        LOGE("  idxReg %d", idxReg);
-        LOGE("  endReg %d", loopAnalysis->endConditionReg);
-        LOGE("  maxC %d", arrayAccessInfo->maxC);
-        LOGE("  minC %d", arrayAccessInfo->minC);
-        LOGE("  opcode %d", loopAnalysis->loopBranchOpcode);
-    }
-}
-
 static void genHoistedChecks(CompilationUnit *cUnit)
 {
     unsigned int i;
     BasicBlock *entry = cUnit->blockList[0];
     LoopAnalysis *loopAnalysis = cUnit->loopAnalysis;
-    ArrayAccessInfo *arrayAccessInfo;
     int globalMaxC = 0;
     int globalMinC = 0;
     /* Should be loop invariant */
@@ -427,11 +435,12 @@ static void genHoistedChecks(CompilationUnit *cUnit)
                 boundCheckMIR->dalvikInsn.vA = loopAnalysis->endConditionReg;
                 boundCheckMIR->dalvikInsn.vB = globalMinC;
                 /*
-                 * If the end condition is ">", add 1 back to the constant field
-                 * to reflect the fact that the smallest index value is
-                 * "endValue + constant + 1".
+                 * If the end condition is ">" in the source, the check in the
+                 * Dalvik bytecode is OP_IF_LE. In this case add 1 back to the
+                 * constant field to reflect the fact that the smallest index
+                 * value is "endValue + constant + 1".
                  */
-                if (loopAnalysis->loopBranchOpcode == OP_IF_LT) {
+                if (loopAnalysis->loopBranchOpcode == OP_IF_LE) {
                     boundCheckMIR->dalvikInsn.vB++;
                 }
                 dvmCompilerAppendMIR(entry, boundCheckMIR);
@@ -458,15 +467,17 @@ static void genHoistedChecks(CompilationUnit *cUnit)
     }
 }
 
-/* Main entry point to do loop optimization */
-void dvmCompilerLoopOpt(CompilationUnit *cUnit)
+/*
+ * Main entry point to do loop optimization.
+ * Return false if sanity checks for loop formation/optimization failed.
+ */
+bool dvmCompilerLoopOpt(CompilationUnit *cUnit)
 {
-    int numDalvikReg = cUnit->method->registersSize;
     LoopAnalysis *loopAnalysis = dvmCompilerNew(sizeof(LoopAnalysis), true);
 
-    assert(cUnit->blockList[0]->blockType == kEntryBlock);
+    assert(cUnit->blockList[0]->blockType == kTraceEntryBlock);
     assert(cUnit->blockList[2]->blockType == kDalvikByteCode);
-    assert(cUnit->blockList[3]->blockType == kExitBlock);
+    assert(cUnit->blockList[3]->blockType == kTraceExitBlock);
 
     cUnit->loopAnalysis = loopAnalysis;
     /*
@@ -499,7 +510,7 @@ void dvmCompilerLoopOpt(CompilationUnit *cUnit)
 
     /* If the loop turns out to be non-optimizable, return early */
     if (!isLoopOptimizable(cUnit))
-        return;
+        return false;
 
     loopAnalysis->arrayAccessInfo = dvmCompilerNew(sizeof(GrowableList), true);
     dvmInitGrowableList(loopAnalysis->arrayAccessInfo, 4);
@@ -511,4 +522,5 @@ void dvmCompilerLoopOpt(CompilationUnit *cUnit)
      * header.
      */
     genHoistedChecks(cUnit);
+    return true;
 }

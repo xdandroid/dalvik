@@ -429,8 +429,6 @@ static ClassObject* callPrep(Thread* self, const Method* method, Object* obj,
 void dvmCallMethod(Thread* self, const Method* method, Object* obj,
     JValue* pResult, ...)
 {
-    JValue result;
-
     va_list args;
     va_start(args, pResult);
     dvmCallMethodV(self, method, obj, false, pResult, args);
@@ -520,22 +518,20 @@ void dvmCallMethodV(Thread* self, const Method* method, Object* obj,
     //dvmDumpThreadStack(dvmThreadSelf());
 
     if (dvmIsNativeMethod(method)) {
-#ifdef WITH_PROFILER
         TRACE_METHOD_ENTER(self, method);
-#endif
         /*
          * Because we leave no space for local variables, "curFrame" points
          * directly at the method arguments.
          */
         (*method->nativeFunc)(self->curFrame, pResult, method, self);
-#ifdef WITH_PROFILER
         TRACE_METHOD_EXIT(self, method);
-#endif
     } else {
         dvmInterpret(self, method, pResult);
     }
 
+#ifndef NDEBUG
 bail:
+#endif
     dvmPopFrame(self);
 }
 
@@ -626,17 +622,13 @@ void dvmCallMethodA(Thread* self, const Method* method, Object* obj,
 #endif
 
     if (dvmIsNativeMethod(method)) {
-#ifdef WITH_PROFILER
         TRACE_METHOD_ENTER(self, method);
-#endif
         /*
          * Because we leave no space for local variables, "curFrame" points
          * directly at the method arguments.
          */
         (*method->nativeFunc)(self->curFrame, pResult, method, self);
-#ifdef WITH_PROFILER
         TRACE_METHOD_EXIT(self, method);
-#endif
     } else {
         dvmInterpret(self, method, pResult);
     }
@@ -666,6 +658,7 @@ Object* dvmInvokeMethod(Object* obj, const Method* method,
     s4* ins;
     int verifyCount, argListLength;
     JValue retval;
+    bool needPop = false;
 
     /* verify arg count */
     if (argList != NULL)
@@ -683,6 +676,7 @@ Object* dvmInvokeMethod(Object* obj, const Method* method,
     clazz = callPrep(self, method, obj, !noAccessCheck);
     if (clazz == NULL)
         return NULL;
+    needPop = true;
 
     /* "ins" for new frame start at frame pointer plus locals */
     ins = ((s4*)self->curFrame) + (method->registersSize - method->insSize);
@@ -718,9 +712,10 @@ Object* dvmInvokeMethod(Object* obj, const Method* method,
                     (*(types-1))->descriptor);
             }
             dvmPopFrame(self);      // throw wants to pull PC out of stack
+            needPop = false;
             dvmThrowException("Ljava/lang/IllegalArgumentException;",
                 "argument type mismatch");
-            goto bail_popped;
+            goto bail;
         }
 
         ins += width;
@@ -736,20 +731,23 @@ Object* dvmInvokeMethod(Object* obj, const Method* method,
     //dvmDumpThreadStack(dvmThreadSelf());
 
     if (dvmIsNativeMethod(method)) {
-#ifdef WITH_PROFILER
         TRACE_METHOD_ENTER(self, method);
-#endif
         /*
          * Because we leave no space for local variables, "curFrame" points
          * directly at the method arguments.
          */
         (*method->nativeFunc)(self->curFrame, &retval, method, self);
-#ifdef WITH_PROFILER
         TRACE_METHOD_EXIT(self, method);
-#endif
     } else {
         dvmInterpret(self, method, &retval);
     }
+
+    /*
+     * Pop the frame immediately.  The "wrap" calls below can cause
+     * allocations, and we don't want the GC to walk the now-dead frame.
+     */
+    dvmPopFrame(self);
+    needPop = false;
 
     /*
      * If an exception is raised, wrap and replace.  This is necessary
@@ -776,8 +774,9 @@ Object* dvmInvokeMethod(Object* obj, const Method* method,
     }
 
 bail:
-    dvmPopFrame(self);
-bail_popped:
+    if (needPop) {
+        dvmPopFrame(self);
+    }
     return retObj;
 }
 
@@ -790,7 +789,7 @@ static int lineNumForPcCb(void *cnxt, u4 address, u4 lineNum)
 {
     LineNumFromPcContext *pContext = (LineNumFromPcContext *)cnxt;
 
-    // We know that this callback will be called in 
+    // We know that this callback will be called in
     // ascending address order, so keep going until we find
     // a match or we've just gone past it.
 
@@ -834,7 +833,7 @@ int dvmLineNumFromPC(const Method* method, u4 relPc)
             method->prototype.protoIdx,
             method->accessFlags,
             lineNumForPcCb, NULL, &context);
-    
+
     return context.lineNum;
 }
 
@@ -867,9 +866,9 @@ int dvmComputeExactFrameDepth(const void* fp)
 int dvmComputeVagueFrameDepth(Thread* thread, const void* fp)
 {
     const u1* interpStackStart = thread->interpStackStart;
-    const u1* interpStackBottom = interpStackStart - thread->interpStackSize;
 
-    assert((u1*) fp >= interpStackBottom && (u1*) fp < interpStackStart);
+    assert((u1*) fp >= interpStackStart - thread->interpStackSize);
+    assert((u1*) fp < interpStackStart);
     return interpStackStart - (u1*) fp;
 }
 
@@ -966,7 +965,7 @@ ClassObject* dvmGetCaller3Class(const void* curFrame)
         if (caller == NULL)
             return NULL;
     }
-    
+
     return SAVEAREA_FROM_FP(caller)->method->clazz;
 }
 
@@ -1380,4 +1379,3 @@ void dvmDumpRunningThreadStack(const DebugOutputTarget* target, Thread* thread)
     dumpFrames(target, stackCopy + fpOffset, thread);
     free(stackCopy);
 }
-

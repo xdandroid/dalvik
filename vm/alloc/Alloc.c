@@ -19,6 +19,7 @@
 #include "Dalvik.h"
 #include "alloc/Heap.h"
 #include "alloc/HeapInternal.h"
+#include "alloc/HeapSource.h"
 
 #if WITH_HPROF && WITH_HPROF_STACK
 #include "hprof/Hprof.h"
@@ -48,6 +49,15 @@ bool dvmGcStartupAfterZygote(void)
         return false;
     }
     return dvmHeapStartupAfterZygote();
+}
+
+/*
+ * Shutdown the threads internal to the garbage collector.
+ */
+void dvmGcThreadShutdown(void)
+{
+    dvmHeapWorkerShutdown();
+    dvmHeapThreadShutdown();
 }
 
 /*
@@ -99,7 +109,7 @@ static Object* createStockException(const char* descriptor, const char* msg)
     if (msg == NULL) {
         msgStr = NULL;
     } else {
-        msgStr = dvmCreateStringFromCstr(msg, ALLOC_DEFAULT);
+        msgStr = dvmCreateStringFromCstr(msg);
         if (msgStr == NULL) {
             LOGW("Could not allocate message string \"%s\"\n", msg);
             dvmReleaseTrackedAlloc(obj, self);
@@ -174,8 +184,6 @@ Object* dvmAllocObject(ClassObject* clazz, int flags)
     newObj = dvmMalloc(clazz->objectSize, flags);
     if (newObj != NULL) {
         DVM_OBJECT_INIT(newObj, clazz);
-        LOGVV("AllocObject: %s (%d)\n", clazz->descriptor,
-            (int) clazz->objectSize);
 #if WITH_HPROF && WITH_HPROF_STACK
         hprofFillInStackTrace(newObj);
 #endif
@@ -210,8 +218,11 @@ Object* dvmCloneObject(Object* obj)
     else
         flags = ALLOC_DEFAULT;
 
-//TODO: use clazz->objectSize for non-arrays
-    size = dvmObjectSizeInHeap(obj);
+    if (IS_CLASS_FLAG_SET(obj->clazz, CLASS_ISARRAY)) {
+        size = dvmArrayObjectSize((ArrayObject *)obj);
+    } else {
+        size = obj->clazz->objectSize;
+    }
 
     copy = dvmMalloc(size, flags);
     if (copy == NULL)
@@ -223,12 +234,7 @@ Object* dvmCloneObject(Object* obj)
 
     memcpy(copy, obj, size);
     DVM_LOCK_INIT(&copy->lock);
-
-    //LOGV("CloneObject: %p->%p %s (%d)\n", obj, copy, obj->clazz->name, size);
-
-    // TODO: deal with reference classes
-
-    /* don't call dvmReleaseTrackedAlloc -- the caller must do that */
+    dvmWriteBarrierObject(copy);
 
     return copy;
 }
@@ -248,8 +254,6 @@ void dvmAddTrackedAlloc(Object* obj, Thread* self)
 {
     if (self == NULL)
         self = dvmThreadSelf();
-
-    //LOGI("TRACK ADD %p\n", obj);
 
     assert(self != NULL);
     if (!dvmAddToReferenceTable(&self->internalLocalRefTable, obj)) {
@@ -275,9 +279,6 @@ void dvmReleaseTrackedAlloc(Object* obj, Thread* self)
         self = dvmThreadSelf();
     assert(self != NULL);
 
-    //LOGI("TRACK REM %p (%s)\n", obj,
-    //    (obj->clazz != NULL) ? obj->clazz->name : "");
-
     if (!dvmRemoveFromReferenceTable(&self->internalLocalRefTable,
             self->internalLocalRefTable.table, obj))
     {
@@ -294,9 +295,35 @@ void dvmReleaseTrackedAlloc(Object* obj, Thread* self)
 void dvmCollectGarbage(bool collectSoftReferences)
 {
     dvmLockHeap();
-
-    LOGVV("Explicit GC\n");
+    while (gDvm.gcHeap->gcRunning) {
+        dvmWaitForConcurrentGcToComplete();
+    }
     dvmCollectGarbageInternal(collectSoftReferences, GC_EXPLICIT);
-
     dvmUnlockHeap();
+}
+
+typedef struct {
+    const ClassObject *clazz;
+    size_t count;
+} CountInstancesOfClassContext;
+
+static void countInstancesOfClassCallback(void *ptr, void *arg)
+{
+    CountInstancesOfClassContext *ctx = arg;
+    const Object *obj = ptr;
+
+    assert(ctx != NULL);
+    if (obj->clazz == ctx->clazz) {
+        ctx->count += 1;
+    }
+}
+
+size_t dvmCountInstancesOfClass(const ClassObject *clazz)
+{
+    CountInstancesOfClassContext ctx = { clazz, 0 };
+    HeapBitmap *bitmap = dvmHeapSourceGetLiveBits();
+    dvmLockHeap();
+    dvmHeapBitmapWalk(bitmap, countInstancesOfClassCallback, &ctx);
+    dvmUnlockHeap();
+    return ctx.count;
 }

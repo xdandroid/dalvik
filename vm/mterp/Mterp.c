@@ -33,8 +33,6 @@ bool dvmCheckAsmConstants(void)
 
     extern char dvmAsmInstructionStart[];
     extern char dvmAsmInstructionEnd[];
-    extern char dvmAsmSisterStart[];
-    extern char dvmAsmSisterEnd[];
 
 #define ASM_DEF_VERIFY
 #include "mterp/common/asm-constants.h"
@@ -55,9 +53,6 @@ bool dvmCheckAsmConstants(void)
         LOGE("(did an instruction handler exceed %d bytes?)\n", width);
         dvmAbort();
     }
-    int sisterSize = dvmAsmSisterEnd - dvmAsmSisterStart;
-    LOGV("mterp: interp is %d bytes, sisters are %d bytes\n",
-        interpSize, sisterSize);
 
 #endif // ndef DVM_NO_ASM_INTERP
 
@@ -81,17 +76,18 @@ bool dvmMterpStd(Thread* self, InterpState* glue)
 
     glue->interpStackEnd = self->interpStackEnd;
     glue->pSelfSuspendCount = &self->suspendCount;
+    glue->cardTable = gDvm.biasedCardTableBase;
 #if defined(WITH_JIT)
     glue->pJitProfTable = gDvmJit.pProfTable;
     glue->ppJitProfTable = &gDvmJit.pProfTable;
     glue->jitThreshold = gDvmJit.threshold;
 #endif
-#if defined(WITH_DEBUGGER)
-    glue->pDebuggerActive = &gDvm.debuggerActive;
-#endif
-#if defined(WITH_PROFILER)
+    if (gDvm.jdwpConfigured) {
+        glue->pDebuggerActive = &gDvm.debuggerActive;
+    } else {
+        glue->pDebuggerActive = NULL;
+    }
     glue->pActiveProfilers = &gDvm.activeProfilers;
-#endif
 
     IF_LOGVV() {
         char* desc = dexProtoCopyMethodDescriptor(&glue->method->prototype);

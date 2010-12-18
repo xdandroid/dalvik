@@ -36,8 +36,6 @@
 
 /*
  * Register VM-agnostic native methods for system classes.
- *
- * Currently defined in ../include/nativehelper/AndroidSystemNatives.h
  */
 extern int jniRegisterSystemMethods(JNIEnv* env);
 
@@ -53,6 +51,15 @@ struct DvmGlobals gDvm;
 /* JIT-specific global state */
 #if defined(WITH_JIT)
 struct DvmJitGlobals gDvmJit;
+
+#if defined(WITH_JIT_TUNING)
+/*
+ * Track the number of hits in the inline cache for predicted chaining.
+ * Use an ugly global variable here since it is accessed in assembly code.
+ */
+int gDvmICHitCount;
+#endif
+
 #endif
 
 /*
@@ -104,9 +111,14 @@ static void dvmUsage(const char* progName)
     dvmFprintf(stderr,
                 "  -Xjnigreflimit:N  (must be multiple of 100, >= 200)\n");
     dvmFprintf(stderr, "  -Xjniopts:{warnonly,forcecopy}\n");
+    dvmFprintf(stderr, "  -Xjnitrace:substring (eg NativeClass or nativeMethod)\n");
     dvmFprintf(stderr, "  -Xdeadlockpredict:{off,warn,err,abort}\n");
     dvmFprintf(stderr, "  -Xstacktracefile:<filename>\n");
     dvmFprintf(stderr, "  -Xgc:[no]precise\n");
+    dvmFprintf(stderr, "  -Xgc:[no]preverify\n");
+    dvmFprintf(stderr, "  -Xgc:[no]postverify\n");
+    dvmFprintf(stderr, "  -Xgc:[no]concurrent\n");
+    dvmFprintf(stderr, "  -Xgc:[no]verifycardtable\n");
     dvmFprintf(stderr, "  -Xgenregmap\n");
     dvmFprintf(stderr, "  -Xcheckdexsum\n");
 #if defined(WITH_JIT)
@@ -125,12 +137,8 @@ static void dvmUsage(const char* progName)
 #endif
     dvmFprintf(stderr, "\n");
     dvmFprintf(stderr, "Configured with:"
-#ifdef WITH_DEBUGGER
         " debugger"
-#endif
-#ifdef WITH_PROFILER
         " profiler"
-#endif
 #ifdef WITH_MONITOR_TRACKING
         " monitor_tracking"
 #endif
@@ -142,9 +150,6 @@ static void dvmUsage(const char* progName)
 #endif
 #ifdef WITH_HPROF_STACK
         " hprof_stack"
-#endif
-#ifdef WITH_HPROF_STACK_UNREACHABLE
-        " hprof_stack_unreachable"
 #endif
 #ifdef WITH_ALLOC_LIMITS
         " alloc_limits"
@@ -161,7 +166,7 @@ static void dvmUsage(const char* progName)
 #ifdef WITH_EXTRA_GC_CHECKS
         " extra_gc_checks"
 #endif
-#ifdef WITH_DALVIK_ASSERT
+#if !defined(NDEBUG) && defined(WITH_DALVIK_ASSERT)
         " dalvik_assert"
 #endif
 #ifdef WITH_JNI_STACK_CHECK
@@ -176,21 +181,14 @@ static void dvmUsage(const char* progName)
 #ifdef PROFILE_FIELD_ACCESS
         " profile_field_access"
 #endif
-#ifdef DVM_TRACK_HEAP_MARKING
-        " track_heap_marking"
-#endif
-#if DVM_RESOLVER_CACHE == DVM_RC_REDUCING
-        " resolver_cache_reducing"
-#elif DVM_RESOLVER_CACHE == DVM_RC_EXPANDING
-        " resolver_cache_expanding"
-#elif DVM_RESOLVER_CACHE == DVM_RC_NO_CACHE
-        " resolver_cache_disabled"
-#endif
 #if defined(WITH_JIT)
-        " jit"
+        " jit(" ARCH_VARIANT ")"
 #endif
 #if defined(WITH_SELF_VERIFICATION)
         " self_verification"
+#endif
+#if ANDROID_SMP != 0
+        " smp"
 #endif
     );
 #ifdef DVM_SHOW_EXCEPTION
@@ -217,7 +215,7 @@ static void showVersion(void)
 {
     dvmFprintf(stdout, "DalvikVM version %d.%d.%d\n",
         DALVIK_MAJOR_VERSION, DALVIK_MINOR_VERSION, DALVIK_BUG_VERSION);
-    dvmFprintf(stdout, 
+    dvmFprintf(stdout,
         "Copyright (C) 2007 The Android Open Source Project\n\n"
         "This software is built from source code licensed under the "
         "Apache License,\n"
@@ -627,7 +625,7 @@ static void processXjitmethod(const char *opt)
     gDvmJit.methodTable = dvmHashTableCreate(8, NULL);
 
     start = buf;
-    /* 
+    /*
      * Break comma-separated method signatures and enter them into the hash
      * table individually.
      */
@@ -825,7 +823,6 @@ static int dvmProcessOptions(int argc, const char* const argv[],
             strncmp(argv[i], "-agentlib:jdwp=", 15) == 0)
         {
             const char* tail;
-            bool result = false;
 
             if (argv[i][1] == 'X')
                 tail = argv[i] + 10;
@@ -877,7 +874,8 @@ static int dvmProcessOptions(int argc, const char* const argv[],
                 return -1;
             }
             gDvm.jniGrefLimit = lim;
-
+        } else if (strncmp(argv[i], "-Xjnitrace:", 11) == 0) {
+            gDvm.jniTrace = strdup(argv[i] + 11);
         } else if (strcmp(argv[i], "-Xlog-stdio") == 0) {
             gDvm.logStdio = true;
 
@@ -897,7 +895,8 @@ static int dvmProcessOptions(int argc, const char* const argv[],
                     /* keep going */
                 }
             } else {
-                /* disable JIT -- nothing to do here for now */
+                /* disable JIT if it was enabled by default */
+                gDvm.executionMode = kExecutionModeInterpFast;
             }
 
         } else if (strncmp(argv[i], "-Xlockprofthreshold:", 20) == 0) {
@@ -964,6 +963,22 @@ static int dvmProcessOptions(int argc, const char* const argv[],
                 gDvm.preciseGc = true;
             else if (strcmp(argv[i] + 5, "noprecise") == 0)
                 gDvm.preciseGc = false;
+            else if (strcmp(argv[i] + 5, "preverify") == 0)
+                gDvm.preVerify = true;
+            else if (strcmp(argv[i] + 5, "nopreverify") == 0)
+                gDvm.preVerify = false;
+            else if (strcmp(argv[i] + 5, "postverify") == 0)
+                gDvm.postVerify = true;
+            else if (strcmp(argv[i] + 5, "nopostverify") == 0)
+                gDvm.postVerify = false;
+            else if (strcmp(argv[i] + 5, "concurrent") == 0)
+                gDvm.concurrentMarkSweep = true;
+            else if (strcmp(argv[i] + 5, "noconcurrent") == 0)
+                gDvm.concurrentMarkSweep = false;
+            else if (strcmp(argv[i] + 5, "verifycardtable") == 0)
+                gDvm.verifyCardTable = true;
+            else if (strcmp(argv[i] + 5, "noverifycardtable") == 0)
+                gDvm.verifyCardTable = false;
             else {
                 dvmFprintf(stderr, "Bad value for -Xgc");
                 return -1;
@@ -972,6 +987,9 @@ static int dvmProcessOptions(int argc, const char* const argv[],
 
         } else if (strcmp(argv[i], "-Xcheckdexsum") == 0) {
             gDvm.verifyDexChecksum = true;
+
+        } else if (strcmp(argv[i], "-Xprofile:wallclock") == 0) {
+            gDvm.profilerWallClock = true;
 
         } else {
             if (!ignoreUnrecognized) {
@@ -1016,6 +1034,8 @@ static void setCommandLineDefaults()
     gDvm.heapSizeMax = 16 * 1024 * 1024;    // Spec says 75% physical mem
     gDvm.stackSize = kDefaultStackSize;
 
+    gDvm.concurrentMarkSweep = true;
+
     /* gDvm.jdwpSuspend = true; */
 
     /* allowed unless zygote config doesn't allow it */
@@ -1037,6 +1057,12 @@ static void setCommandLineDefaults()
 #else
     gDvm.executionMode = kExecutionModeInterpFast;
 #endif
+
+    /*
+     * SMP support is a compile-time define, but we may want to have
+     * dexopt target a differently-configured device.
+     */
+    gDvm.dexOptForSmp = (ANDROID_SMP != 0);
 }
 
 
@@ -1190,10 +1216,8 @@ int dvmStartup(int argc, const char* const argv[], bool ignoreUnrecognized,
         goto fail;
     if (!dvmReflectStartup())
         goto fail;
-#ifdef WITH_PROFILER
     if (!dvmProfilingStartup())
         goto fail;
-#endif
 
     /* make sure we got these [can this go away?] */
     assert(gDvm.classJavaLangClass != NULL);
@@ -1352,7 +1376,7 @@ bool dvmInitAfterZygote(void)
 {
     u8 startHeap, startQuit, startJdwp;
     u8 endHeap, endQuit, endJdwp;
-    
+
     startHeap = dvmGetRelativeTimeUsec();
 
     /*
@@ -1427,11 +1451,6 @@ bool dvmInitAfterZygote(void)
 static bool dvmInitJDWP(void)
 {
     assert(!gDvm.zygote);
-
-#ifndef WITH_DEBUGGER
-    LOGI("Debugger support not compiled into VM\n");
-    return false;
-#endif
 
     /*
      * Init JDWP if the debugger is enabled.  This may connect out to a
@@ -1509,6 +1528,14 @@ int dvmPrepForDexOpt(const char* bootClassPath, DexOptimizerMode dexOptMode,
     gDvm.dexOptMode = dexOptMode;
     gDvm.classVerifyMode = verifyMode;
     gDvm.generateRegisterMaps = (dexoptFlags & DEXOPT_GEN_REGISTER_MAPS) != 0;
+    if (dexoptFlags & DEXOPT_SMP) {
+        assert((dexoptFlags & DEXOPT_UNIPROCESSOR) == 0);
+        gDvm.dexOptForSmp = true;
+    } else if (dexoptFlags & DEXOPT_UNIPROCESSOR) {
+        gDvm.dexOptForSmp = false;
+    } else {
+        gDvm.dexOptForSmp = (ANDROID_SMP != 0);
+    }
 
     /*
      * Initialize the heap, some basic thread control mutexes, and
@@ -1572,12 +1599,14 @@ void dvmShutdown(void)
     /*
      * Stop our internal threads.
      */
-    dvmHeapWorkerShutdown();
+    dvmGcThreadShutdown();
 
     if (gDvm.jdwpState != NULL)
         dvmJdwpShutdown(gDvm.jdwpState);
     free(gDvm.jdwpHost);
     gDvm.jdwpHost = NULL;
+    free(gDvm.jniTrace);
+    gDvm.jniTrace = NULL;
     free(gDvm.stackTraceFile);
     gDvm.stackTraceFile = NULL;
 
@@ -1606,9 +1635,7 @@ void dvmShutdown(void)
 
     dvmDebuggerShutdown();
     dvmReflectShutdown();
-#ifdef WITH_PROFILER
     dvmProfilingShutdown();
-#endif
     dvmJniShutdown();
     dvmStringInternShutdown();
     dvmExceptionShutdown();

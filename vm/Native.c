@@ -57,7 +57,7 @@ void dvmNativeShutdown(void)
  *
  * This is executed as if it were a native bridge or function.  If the
  * resolution succeeds, method->insns is replaced, and we don't go through
- * here again.
+ * here again unless the method is unregistered.
  *
  * Initializes method's class if necessary.
  *
@@ -103,8 +103,7 @@ void dvmResolveNativeMethod(const u4* args, JValue* pResult,
             dvmAbort();     // harsh, but this is VM-internal problem
         }
         DalvikBridgeFunc dfunc = (DalvikBridgeFunc) func;
-        dvmSetNativeFunc(method, dfunc, NULL);
-        assert(method->insns == NULL);
+        dvmSetNativeFunc((Method*) method, dfunc, NULL);
         dfunc(args, pResult, method, self);
         return;
     }
@@ -213,7 +212,6 @@ static SharedLib* findSharedLibEntry(const char* pathName)
 static SharedLib* addSharedLibEntry(SharedLib* pLib)
 {
     u4 hash = dvmComputeUtf8Hash(pLib->pathName);
-    void* ent;
 
     /*
      * Do the lookup with the "add" flag set.  If we add it, we will get
@@ -260,130 +258,6 @@ char* dvmCreateSystemLibraryName(char* libName)
         return strdup(buf);
 }
 
-
-#if 0
-/*
- * Find a library, given the lib's system-dependent name (e.g. "libjpeg.so").
- *
- * We need to search through the path defined by the java.library.path
- * property.
- *
- * Returns NULL if the library was not found.
- */
-static char* findLibrary(const char* libSysName)
-{
-    char* javaLibraryPath = NULL;
-    char* testName = NULL;
-    char* start;
-    char* cp;
-    bool done;
-
-    javaLibraryPath = dvmGetProperty("java.library.path");
-    if (javaLibraryPath == NULL)
-        goto bail;
-
-    LOGVV("+++ path is '%s'\n", javaLibraryPath);
-
-    start = cp = javaLibraryPath;
-    while (cp != NULL) {
-        char pathBuf[256];
-        int len;
-
-        cp = strchr(start, ':');
-        if (cp != NULL)
-            *cp = '\0';
-
-        len = snprintf(pathBuf, sizeof(pathBuf), "%s/%s", start, libSysName);
-        if (len >= (int) sizeof(pathBuf)) {
-            LOGW("Path overflowed %d bytes: '%s' / '%s'\n",
-                len, start, libSysName);
-            /* keep going, next one might fit */
-        } else {
-            LOGVV("+++  trying '%s'\n", pathBuf);
-            if (access(pathBuf, R_OK) == 0) {
-                testName = strdup(pathBuf);
-                break;
-            }
-        }
-
-        start = cp +1;
-    }
-
-bail:
-    free(javaLibraryPath);
-    return testName;
-}
-
-/*
- * Load a native shared library, given the system-independent piece of
- * the library name.
- *
- * Throws an exception on failure.
- */
-void dvmLoadNativeLibrary(StringObject* libNameObj, Object* classLoader)
-{
-    char* libName = NULL;
-    char* libSysName = NULL;
-    char* libPath = NULL;
-
-    /*
-     * If "classLoader" isn't NULL, call the class loader's "findLibrary"
-     * method with the lib name.  If it returns a non-NULL result, we use
-     * that as the pathname.
-     */
-    if (classLoader != NULL) {
-        Method* findLibrary;
-        Object* findLibResult;
-
-        findLibrary = dvmFindVirtualMethodByDescriptor(classLoader->clazz,
-            "findLibrary", "(Ljava/lang/String;)Ljava/lang/String;");
-        if (findLibrary == NULL) {
-            LOGW("Could not find findLibrary() in %s\n",
-                classLoader->clazz->name);
-            dvmThrowException("Ljava/lang/UnsatisfiedLinkError;",
-                "findLibrary");
-            goto bail;
-        }
-
-        findLibResult = (Object*)(u4) dvmCallMethod(findLibrary, classLoader,
-                                            libNameObj);
-        if (dvmCheckException()) {
-            LOGV("returning early on exception\n");
-            goto bail;
-        }
-        if (findLibResult != NULL) {
-            /* success! */
-            libPath = dvmCreateCstrFromString(libNameObj);
-            LOGI("Found library through CL: '%s'\n", libPath);
-            dvmLoadNativeCode(libPath, classLoader);
-            goto bail;
-        }
-    }
-
-    libName = dvmCreateCstrFromString(libNameObj);
-    if (libName == NULL)
-        goto bail;
-    libSysName = dvmCreateSystemLibraryName(libName);
-    if (libSysName == NULL)
-        goto bail;
-
-    libPath = findLibrary(libSysName);
-    if (libPath != NULL) {
-        LOGD("Found library through path: '%s'\n", libPath);
-        dvmLoadNativeCode(libPath, classLoader);
-    } else {
-        LOGW("Unable to locate shared lib matching '%s'\n", libSysName);
-        dvmThrowException("Ljava/lang/UnsatisfiedLinkError;", libName);
-    }
-
-bail:
-    free(libName);
-    free(libSysName);
-    free(libPath);
-}
-#endif
-
-
 /*
  * Check the result of an earlier call to JNI_OnLoad on this library.  If
  * the call has not yet finished in another thread, wait for it.
@@ -408,7 +282,7 @@ static bool checkOnLoadResult(SharedLib* pEntry)
     while (pEntry->onLoadResult == kOnLoadPending) {
         LOGD("threadid=%d: waiting for %s OnLoad status\n",
             self->threadId, pEntry->pathName);
-        int oldStatus = dvmChangeStatus(self, THREAD_VMWAIT);
+        ThreadStatus oldStatus = dvmChangeStatus(self, THREAD_VMWAIT);
         pthread_cond_wait(&pEntry->onLoadCond, &pEntry->onLoadLock);
         dvmChangeStatus(self, oldStatus);
     }
@@ -438,19 +312,25 @@ typedef int (*OnLoadFunc)(JavaVM*, void*);
  * The library will be associated with the specified class loader.  The JNI
  * spec says we can't load the same library into more than one class loader.
  *
- * Returns "true" on success.
+ * Returns "true" on success. On failure, sets *detail to a
+ * human-readable description of the error or NULL if no detail is
+ * available; ownership of the string is transferred to the caller.
  */
-bool dvmLoadNativeCode(const char* pathName, Object* classLoader)
+bool dvmLoadNativeCode(const char* pathName, Object* classLoader,
+        char** detail)
 {
     SharedLib* pEntry;
     void* handle;
     bool verbose;
 
     /* reduce noise by not chattering about system libraries */
-    verbose = strncmp(pathName, "/system", sizeof("/system")-1) != 0;
+    verbose = !!strncmp(pathName, "/system", sizeof("/system")-1);
+    verbose = verbose && !!strncmp(pathName, "/vendor", sizeof("/vendor")-1);
 
     if (verbose)
         LOGD("Trying to load lib %s %p\n", pathName, classLoader);
+
+    *detail = NULL;
 
     /*
      * See if we've already loaded it.  If we have, and the class loader
@@ -500,12 +380,12 @@ bool dvmLoadNativeCode(const char* pathName, Object* classLoader)
      * the GC to ignore us.
      */
     Thread* self = dvmThreadSelf();
-    int oldStatus = dvmChangeStatus(self, THREAD_VMWAIT);
+    ThreadStatus oldStatus = dvmChangeStatus(self, THREAD_VMWAIT);
     handle = dlopen(pathName, RTLD_LAZY);
     dvmChangeStatus(self, oldStatus);
 
     if (handle == NULL) {
-        LOGI("Unable to dlopen(%s): %s\n", pathName, dlerror());
+        *detail = strdup(dlerror());
         return false;
     }
 
@@ -591,6 +471,71 @@ bool dvmLoadNativeCode(const char* pathName, Object* classLoader)
         dvmUnlockMutex(&pNewEntry->onLoadLock);
         return result;
     }
+}
+
+
+/*
+ * Un-register JNI native methods.
+ *
+ * There are two relevant fields in struct Method, "nativeFunc" and
+ * "insns".  The former holds a function pointer to a "bridge" function
+ * (or, for internal native, the actual implementation).  The latter holds
+ * a pointer to the actual JNI method.
+ *
+ * The obvious approach is to reset both fields to their initial state
+ * (nativeFunc points at dvmResolveNativeMethod, insns holds NULL), but
+ * that creates some unpleasant race conditions.  In particular, if another
+ * thread is executing inside the call bridge for the method in question,
+ * and we reset insns to NULL, the VM will crash.  (See the comments above
+ * dvmSetNativeFunc() for additional commentary.)
+ *
+ * We can't rely on being able to update two 32-bit fields in one atomic
+ * operation (e.g. no 64-bit atomic ops on ARMv5TE), so we want to change
+ * only one field.  It turns out we can simply reset nativeFunc to its
+ * initial state, leaving insns alone, because dvmResolveNativeMethod
+ * ignores "insns" entirely.
+ *
+ * When the method is re-registered, both fields will be updated, but
+ * dvmSetNativeFunc guarantees that "insns" is updated first.  This means
+ * we shouldn't be in a situation where we have a "live" call bridge and
+ * a stale implementation pointer.
+ */
+static void unregisterJNINativeMethods(Method* methods, size_t count)
+{
+    while (count != 0) {
+        count--;
+
+        Method* meth = &methods[count];
+        if (!dvmIsNativeMethod(meth))
+            continue;
+        if (dvmIsAbstractMethod(meth))      /* avoid abstract method stubs */
+            continue;
+
+        /*
+         * Strictly speaking this ought to test the function pointer against
+         * the various JNI bridge functions to ensure that we only undo
+         * methods that were registered through JNI.  In practice, any
+         * native method with a non-NULL "insns" is a registered JNI method.
+         *
+         * If we inadvertently unregister an internal-native, it'll get
+         * re-resolved on the next call; unregistering an unregistered
+         * JNI method is a no-op.  So we don't really need to test for
+         * anything.
+         */
+
+        LOGD("Unregistering JNI method %s.%s:%s\n",
+            meth->clazz->descriptor, meth->name, meth->shorty);
+        dvmSetNativeFunc(meth, dvmResolveNativeMethod, NULL);
+    }
+}
+
+/*
+ * Un-register all JNI native methods from a class.
+ */
+void dvmUnregisterJNINativeMethods(ClassObject* clazz)
+{
+    unregisterJNINativeMethods(clazz->directMethods, clazz->directMethodCount);
+    unregisterJNINativeMethods(clazz->virtualMethods, clazz->virtualMethodCount);
 }
 
 
@@ -817,3 +762,113 @@ static void* lookupSharedLibMethod(const Method* method)
         (void*) method);
 }
 
+
+static void appendValue(char type, const JValue value, char* buf, size_t n,
+        bool appendComma)
+{
+    size_t len = strlen(buf);
+    if (len >= n - 32) { // 32 should be longer than anything we could append.
+        buf[len - 1] = '.';
+        buf[len - 2] = '.';
+        buf[len - 3] = '.';
+        return;
+    }
+    char* p = buf + len;
+    switch (type) {
+    case 'B':
+        if (value.b >= 0 && value.b < 10) {
+            sprintf(p, "%d", value.b);
+        } else {
+            sprintf(p, "0x%x (%d)", value.b, value.b);
+        }
+        break;
+    case 'C':
+        if (value.c < 0x7f && value.c >= ' ') {
+            sprintf(p, "U+%x ('%c')", value.c, value.c);
+        } else {
+            sprintf(p, "U+%x", value.c);
+        }
+        break;
+    case 'D':
+        sprintf(p, "%g", value.d);
+        break;
+    case 'F':
+        sprintf(p, "%g", value.f);
+        break;
+    case 'I':
+        sprintf(p, "%d", value.i);
+        break;
+    case 'L':
+        sprintf(p, "0x%x", value.i);
+        break;
+    case 'J':
+        sprintf(p, "%lld", value.j);
+        break;
+    case 'S':
+        sprintf(p, "%d", value.s);
+        break;
+    case 'V':
+        strcpy(p, "void");
+        break;
+    case 'Z':
+        strcpy(p, value.z ? "true" : "false");
+        break;
+    default:
+        sprintf(p, "unknown type '%c'", type);
+        break;
+    }
+
+    if (appendComma) {
+        strcat(p, ", ");
+    }
+}
+
+#define LOGI_NATIVE(...) LOG(LOG_INFO, LOG_TAG "-native", __VA_ARGS__)
+
+void dvmLogNativeMethodEntry(const Method* method, const u4* args)
+{
+    char thisString[32] = { 0 };
+    const u4* sp = args; // &args[method->registersSize - method->insSize];
+    if (!dvmIsStaticMethod(method)) {
+        sprintf(thisString, "this=0x%08x ", *sp++);
+    }
+
+    char argsString[128]= { 0 };
+    const char* desc = &method->shorty[1];
+    while (*desc != '\0') {
+        char argType = *desc++;
+        JValue value;
+        if (argType == 'D' || argType == 'J') {
+            value.j = dvmGetArgLong(sp, 0);
+            sp += 2;
+        } else {
+            value.i = *sp++;
+        }
+        appendValue(argType, value, argsString, sizeof(argsString),
+        *desc != '\0');
+    }
+
+    char* signature = dexProtoCopyMethodDescriptor(&method->prototype);
+    LOGI_NATIVE("-> %s.%s%s %s(%s)", method->clazz->descriptor, method->name,
+            signature, thisString, argsString);
+    free(signature);
+}
+
+void dvmLogNativeMethodExit(const Method* method, Thread* self,
+        const JValue returnValue)
+{
+    char* signature = dexProtoCopyMethodDescriptor(&method->prototype);
+    if (dvmCheckException(self)) {
+        Object* exception = dvmGetException(self);
+        LOGI_NATIVE("<- %s.%s%s threw %s", method->clazz->descriptor,
+                method->name, signature, exception->clazz->descriptor);
+    } else {
+        char returnValueString[128] = { 0 };
+        char returnType = method->shorty[0];
+        appendValue(returnType, returnValue,
+                returnValueString, sizeof(returnValueString), false);
+        LOGI_NATIVE("<- %s.%s%s returned %s", method->clazz->descriptor,
+                method->name, signature, returnValueString);
+    }
+    free(signature);
+}

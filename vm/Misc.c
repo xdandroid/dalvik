@@ -26,7 +26,11 @@
 #include <time.h>
 #include <sys/time.h>
 #include <fcntl.h>
+#include <cutils/ashmem.h>
+#include <sys/mman.h>
 
+#define ALIGN_UP_TO_PAGE_SIZE(p) \
+    (((size_t)(p) + (SYSTEM_PAGE_SIZE - 1)) & ~(SYSTEM_PAGE_SIZE - 1))
 
 /*
  * Print a hex dump in this format:
@@ -323,7 +327,7 @@ bool dvmIsBitSet(const BitVector* pBits, int num)
  */
 int dvmCountSetBits(const BitVector* pBits)
 {
-    int word, bit;
+    int word;
     int count = 0;
 
     for (word = 0; word < pBits->storageSize; word++) {
@@ -686,3 +690,49 @@ size_t strlcpy(char *dst, const char *src, size_t size) {
     return srcLength;
 }
 #endif
+
+/*
+ *  Allocates a memory region using ashmem and mmap, initialized to
+ *  zero.  Actual allocation rounded up to page multiple.  Returns
+ *  NULL on failure.
+ */
+void *dvmAllocRegion(size_t size, int prot, const char *name) {
+    void *base;
+    int fd, ret;
+
+    size = ALIGN_UP_TO_PAGE_SIZE(size);
+    fd = ashmem_create_region(name, size);
+    if (fd == -1) {
+        return NULL;
+    }
+    base = mmap(NULL, size, prot, MAP_PRIVATE, fd, 0);
+    ret = close(fd);
+    if (base == MAP_FAILED) {
+        return NULL;
+    }
+    if (ret == -1) {
+        return NULL;
+    }
+    return base;
+}
+
+/* documented in header file */
+const char* dvmPathToAbsolutePortion(const char* path) {
+    if (path == NULL) {
+        return NULL;
+    }
+
+    if (path[0] == '/') {
+        /* It's a regular absolute path. Return it. */
+        return path;
+    }
+
+    const char* sentinel = strstr(path, "/./");
+
+    if (sentinel != NULL) {
+        /* It's got the sentinel. Return a pointer to the second slash. */
+        return sentinel + 2;
+    }
+
+    return NULL;
+}

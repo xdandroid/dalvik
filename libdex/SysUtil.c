@@ -24,20 +24,13 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
-
 #ifdef HAVE_POSIX_FILEMAP
-#include <sys/mman.h>
+# include <sys/mman.h>
 #endif
-
 #include <limits.h>
 #include <errno.h>
 
-/*
- * Having trouble finding a portable way to get this.  sysconf(_SC_PAGE_SIZE)
- * seems appropriate, but we don't have that on the device.  Some systems
- * have getpagesize(2), though the linux man page has some odd cautions.
- */
-#define DEFAULT_PAGE_SIZE   4096
+#include <JNIHelp.h>        // TEMP_FAILURE_RETRY may or may not be in unistd
 
 
 /*
@@ -266,35 +259,25 @@ int sysMapFileInShmemWritableReadOnly(int fd, MemMapping* pMap)
 }
 
 /*
- * Map part of a file (from fd's current offset) into a shared, read-only
- * memory segment.
+ * Map part of a file into a shared, read-only memory segment.  The "start"
+ * offset is absolute, not relative.
  *
  * On success, returns 0 and fills out "pMap".  On failure, returns a nonzero
  * value and does not disturb "pMap".
  */
-int sysMapFileSegmentInShmem(int fd, off_t start, long length,
+int sysMapFileSegmentInShmem(int fd, off_t start, size_t length,
     MemMapping* pMap)
 {
 #ifdef HAVE_POSIX_FILEMAP
-    off_t dummy;
-    size_t fileLength, actualLength;
+    size_t actualLength;
     off_t actualStart;
     int adjust;
     void* memPtr;
 
     assert(pMap != NULL);
 
-    if (getFileStartAndLength(fd, &dummy, &fileLength) < 0)
-        return -1;
-
-    if (start + length > (long)fileLength) {
-        LOGW("bad segment: st=%d len=%ld flen=%d\n",
-            (int) start, length, (int) fileLength);
-        return -1;
-    }
-
     /* adjust to be page-aligned */
-    adjust = start % DEFAULT_PAGE_SIZE;
+    adjust = start % SYSTEM_PAGE_SIZE;
     actualStart = start - adjust;
     actualLength = length + adjust;
 
@@ -400,3 +383,26 @@ void sysCopyMap(MemMapping* dst, const MemMapping* src)
     memcpy(dst, src, sizeof(MemMapping));
 }
 
+/*
+ * Write until all bytes have been written.
+ *
+ * Returns 0 on success, or an errno value on failure.
+ */
+int sysWriteFully(int fd, const void* buf, size_t count, const char* logMsg)
+{
+    while (count != 0) {
+        ssize_t actual = TEMP_FAILURE_RETRY(write(fd, buf, count));
+        if (actual < 0) {
+            int err = errno;
+            LOGE("%s: write failed: %s\n", logMsg, strerror(err));
+            return err;
+        } else if (actual != (ssize_t) count) {
+            LOGD("%s: partial write (will retry): (%d of %zd)\n",
+                logMsg, (int) actual, count);
+            buf = (const void*) (((const u1*) buf) + actual);
+        }
+        count -= actual;
+    }
+
+    return 0;
+}
